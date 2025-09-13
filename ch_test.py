@@ -1,22 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit 예배 자료 업로드 + 라이브 프리뷰(Stage) 앱 (권한/랜딩페이지 + 개편 버전)
-
-기능 개요
-0) 랜딩 페이지에서 역할/이름/직분/액세스 코드 입력 후 입장
-   - 교역자: 작성 및 수정 가능
-   - 미디어부: 작성 및 수정 불가(읽기 전용 확인만 가능)
-   - [테스트 안내] 현재는 모든 액세스 코드 0001로 입장 가능
-1) 달력에서 날짜 선택
-2) 자료 추가(성경 구절 / 이미지 / 기타) + 각 자료에 대한 설명(스토리보드)
-   - 설명(스토리보드) placeholder: "해당 자료의 노출 타이밍, 강조를 원하시는 부분 등을 적어주세요."
-3) "업로드 하기" 클릭 시 Word(.docx) 파일 생성 및 다운로드
-4) 🔎 입력 내용을 4608:2240 자막 화면으로 미리보기(이미지 배경 + 하단 자막)
-
-로컬 실행 방법 (VS Code 권장)
-- Python 3.9+ 권장
-- pip install streamlit python-docx pillow
-- streamlit run app.py
+Streamlit 예배 자료 업로드 + Word 저장 (개편 버전)
+요청 반영:
+1) 예배 구분 직접기입
+2) 자료 순서 조절
+3) 라이브 프리뷰 삭제
+4) 이미지 여러 장 업로드
+5) 설명 강조(**굵게**, ==형광펜==) -> Word 반영
+6) 자료 유형 '설교 전문' 추가
 """
 
 import io
@@ -24,6 +15,7 @@ import os
 import uuid
 import base64
 import tempfile
+import re
 from datetime import date
 from typing import List, Dict, Any
 
@@ -33,7 +25,7 @@ import streamlit as st
 try:
     from docx import Document
     from docx.shared import Inches, Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 except Exception:
     st.warning("python-docx가 설치되지 않았습니다. 터미널에서: pip install python-docx")
     Document = None
@@ -75,11 +67,11 @@ st.markdown(
 # 세션 상태 초기화
 # ---------------------------
 if "materials" not in st.session_state:
-    # 각 항목: {id, kind, file, verse_text, description}
+    # 각 항목: {id, kind, files, file, verse_text, description, full_text}
     st.session_state.materials: List[Dict[str, Any]] = []
 
 if "preview_idx" not in st.session_state:
-    st.session_state.preview_idx = 0
+    st.session_state.preview_idx = 0  # (프리뷰는 제거되었지만 호환을 위해 유지)
 
 # 권한/사용자 상태
 if "authenticated" not in st.session_state:
@@ -93,69 +85,70 @@ if "position" not in st.session_state:
 if "can_edit" not in st.session_state:
     st.session_state.can_edit = False
 
+# 예배 구분(옵션/선택) 상태
+BASE_SERVICES = ["1부", "2부", "3부", "오후예배"]
+if "services_options" not in st.session_state:
+    st.session_state.services_options = BASE_SERVICES.copy()
+if "services_selected" not in st.session_state:
+    st.session_state.services_selected: List[str] = []
+
 # ---------------------------
 # 유틸 함수
 # ---------------------------
 def add_material():
     st.session_state.materials.append({
         "id": str(uuid.uuid4()),
-        "kind": "성경 구절",
-        "file": None,
+        "kind": "성경 구절",     # "성경 구절" | "이미지" | "기타 파일" | "설교 전문"
+        "files": [],             # 이미지 다중 업로드용
+        "file": None,            # 과거 호환(단일 파일)
         "verse_text": "",
-        "description": ""
+        "description": "",
+        "full_text": ""          # 설교 전문
     })
 
 def remove_material(mid: str):
     st.session_state.materials = [m for m in st.session_state.materials if m["id"] != mid]
 
-def _b64_of_upload(file) -> str:
-    """UploadedFile -> data:image/...;base64,.... 문자열"""
-    if file is None:
-        return ""
-    mime = "image/png"
-    ext = os.path.splitext(file.name)[1].lower()
-    if ext in [".jpg", ".jpeg"]:
-        mime = "image/jpeg"
-    b64 = base64.b64encode(file.getvalue()).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
+def move_material(mid: str, direction: str):
+    """direction: 'up' or 'down'"""
+    mats = st.session_state.materials
+    idx = next((i for i, m in enumerate(mats) if m["id"] == mid), None)
+    if idx is None: 
+        return
+    if direction == "up" and idx > 0:
+        mats[idx-1], mats[idx] = mats[idx], mats[idx-1]
+        st.session_state.materials = mats
+        st.rerun()
+    elif direction == "down" and idx < len(mats)-1:
+        mats[idx+1], mats[idx] = mats[idx], mats[idx+1]
+        st.session_state.materials = mats
+        st.rerun()
 
-def build_preview_frames(materials):
+def add_rich_text(paragraph, text: str):
     """
-    프리뷰(자막)용 '장면' 리스트 구성.
-    - 성경 구절: 그 문장 자체가 자막
-    - 이미지: 이미지를 배경으로, 설명(스토리보드)을 자막
-    - 기타 파일: 배경 없음, 설명을 자막
+    간단 마크업 → Word 서식 변환:
+      **굵게**  => bold
+      ==형광펜== => highlight(YELLOW)
+    그 외는 일반 텍스트로 추가.
     """
-    frames = []
-
-    for item in materials:
-        kind = item.get("kind")
-        desc = (item.get("description") or "").strip()
-        verse = (item.get("verse_text") or "").strip()
-        file  = item.get("file")
-
-        if kind == "성경 구절":
-            lines = [ln.strip() for ln in verse.splitlines() if ln.strip()]
-            if not lines:
-                lines = ["(성경 구절 미입력)"]
-            for ln in lines:
-                frames.append({"bg":"", "caption": ln})
-            if desc:
-                frames.append({"bg":"", "caption": desc})
-
-        elif kind == "이미지":
-            bg = _b64_of_upload(file) if file else ""
-            cap = desc or "(설명 없음)"
-            frames.append({"bg": bg, "caption": cap})
-
-        else:  # 기타 파일
-            cap = (f"[첨부] {file.name} — " if file else "") + (desc or "(설명 없음)")
-            frames.append({"bg": "", "caption": cap})
-
-    if not frames:
-        frames = [{"bg":"", "caption":"(자막 미리보기 없음) 자료나 텍스트를 입력하세요."}]
-
-    return frames
+    if not text:
+        return
+    pattern = r'(\*\*.*?\*\*|==.*?==)'
+    parts = re.split(pattern, text)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        elif part.startswith("==") and part.endswith("=="):
+            run = paragraph.add_run(part[2:-2])
+            try:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            except Exception:
+                pass
+        else:
+            paragraph.add_run(part)
 
 def build_docx(
     worship_date: date,
@@ -165,7 +158,7 @@ def build_docx(
     position: str,
     role: str,
 ) -> bytes:
-    """문서(.docx) 생성 후 바이트로 반환 (설교 전문 섹션 삭제된 버전)"""
+    """문서(.docx) 생성 후 바이트로 반환 (설교 전문/강조 마크업 반영 버전)"""
     if Document is None:
         raise RuntimeError("python-docx가 설치되지 않았습니다. 'pip install python-docx' 실행 후 다시 시도해주세요.")
 
@@ -202,44 +195,67 @@ def build_docx(
     else:
         for idx, item in enumerate(materials, start=1):
             kind = item.get("kind", "")
-            verse_text = item.get("verse_text", "")
-            description = item.get("description", "")
-            file = item.get("file")
+            verse_text = item.get("verse_text", "") or ""
+            description = item.get("description", "") or ""
+            full_text = item.get("full_text", "") or ""
+            files = item.get("files", []) or []
+            single_file = item.get("file", None)  # 과거 호환
 
             doc.add_heading(f"{idx}. {kind}", level=2)
 
             if kind == "성경 구절":
                 if verse_text.strip():
                     for line in verse_text.splitlines():
-                        doc.add_paragraph(line)
+                        p = doc.add_paragraph()
+                        add_rich_text(p, line)
                     doc.add_paragraph("")
                 else:
                     doc.add_paragraph("(성경 구절 미입력)")
 
             elif kind == "이미지":
-                if file is not None and Image is not None:
+                # 다중 업로드(현행)
+                if files and Image is not None:
+                    for f in files:
+                        try:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1]) as tmp:
+                                tmp.write(f.getvalue())
+                                tmp.flush()
+                                doc.add_picture(tmp.name, width=Inches(5))
+                        except Exception:
+                            doc.add_paragraph(f"(이미지 삽입 실패) 파일명: {getattr(f, 'name', 'unknown')}")
+                # 단일 파일(과거 호환)
+                elif single_file is not None and Image is not None:
                     try:
-                        # 업로드된 이미지 바이트를 임시 파일로 저장 후 삽입
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
-                            tmp.write(file.getvalue())
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(single_file.name)[1]) as tmp:
+                            tmp.write(single_file.getvalue())
                             tmp.flush()
-                            # 가로 너비 5인치로 리사이즈(비율 유지)
                             doc.add_picture(tmp.name, width=Inches(5))
                     except Exception:
-                        doc.add_paragraph(f"(이미지 삽입 실패) 파일명: {file.name}")
+                        doc.add_paragraph(f"(이미지 삽입 실패) 파일명: {single_file.name}")
                 else:
                     doc.add_paragraph("(이미지 파일 없음)")
 
-            else:  # 기타 파일
-                if file is not None:
-                    doc.add_paragraph(f"첨부 파일: {file.name} (문서에 직접 삽입되지 않습니다)")
+            elif kind == "기타 파일":
+                if single_file is not None:
+                    doc.add_paragraph(f"첨부 파일: {single_file.name} (문서에 직접 삽입되지 않습니다)")
                 else:
                     doc.add_paragraph("(첨부 파일 없음)")
 
+            elif kind == "설교 전문":
+                if full_text.strip():
+                    for line in full_text.splitlines():
+                        p = doc.add_paragraph()
+                        add_rich_text(p, line)
+                else:
+                    doc.add_paragraph("(설교 전문 미입력)")
+
+            # 공통: 설명(스토리보드) — 마크업 반영
+            p = doc.add_paragraph()
+            p.add_run("설명(스토리보드): ")
             if description.strip():
-                doc.add_paragraph("설명(스토리보드): " + description)
+                add_rich_text(p, description)
             else:
-                doc.add_paragraph("설명(스토리보드): (미입력)")
+                p.add_run("(미입력)")
 
             doc.add_paragraph("")
 
@@ -295,7 +311,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ---------------------------
-# 상단 사용자/권한 표시 (1열 구성 시작)
+# 상단 사용자/권한 표시
 # ---------------------------
 can_edit = st.session_state.get("can_edit", False)
 role_badge = "🟢 편집 가능" if can_edit else "🔒 읽기 전용(확인만)"
@@ -306,7 +322,7 @@ st.markdown(
 )
 
 # ---------------------------
-# ① 날짜/예배 선택 (1열)
+# ① 날짜/예배 선택
 # ---------------------------
 st.markdown("<div class='section-title'>① 날짜/예배 선택</div>", unsafe_allow_html=True)
 worship_date = st.date_input(
@@ -316,45 +332,65 @@ worship_date = st.date_input(
     disabled=not can_edit
 )
 
-services = st.multiselect(
-    "예배 구분 선택",
-    options=["1부", "2부", "3부", "오후예배"],
-    default=[],
-    help="해당 날짜에 해당되는 예배를 모두 선택하세요.",
-    disabled=not can_edit
-)
+# 예배 구분: 기본 옵션 + 직접 입력 추가
+col_sv1, col_sv2 = st.columns([2, 1])
+with col_sv1:
+    st.session_state.services_selected = st.multiselect(
+        "예배 구분 선택",
+        options=st.session_state.services_options,
+        default=st.session_state.services_selected,
+        help="해당 날짜에 해당되는 예배를 모두 선택하세요.",
+        disabled=not can_edit
+    )
+with col_sv2:
+    new_service = st.text_input("직접 입력", placeholder="예: 청년예배 / 새벽기도", disabled=not can_edit)
+    add_new = st.button("추가", disabled=not can_edit)
+    if add_new and new_service.strip():
+        if new_service not in st.session_state.services_options:
+            st.session_state.services_options.append(new_service.strip())
+        if new_service not in st.session_state.services_selected:
+            st.session_state.services_selected.append(new_service.strip())
+        st.rerun()
+
+services = st.session_state.services_selected
 
 st.divider()
 
 # ---------------------------
-# ② 자료 추가 (1열)  ← 요청 반영: 순서 변경 & 단일 컬럼
+# ② 자료 추가 (순서 조절 포함)
 # ---------------------------
-st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타)</div>", unsafe_allow_html=True)
-st.caption("설교에 사용하실 자료를 업로드하세요. 각 자료별로 설명(스토리보드)을 작성할 수 있습니다.")
+st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
+st.caption("• 설명(스토리보드)에서 **굵게**, ==형광펜== 으로 강조하면 Word에 그대로 반영됩니다.")
 
 add_btn = st.button("+ 자료 추가", disabled=not can_edit)
 if add_btn and can_edit:
     add_material()
 
-# 각 자료 입력 블록 (세로로 나열)
 to_remove: List[str] = []
 for i, item in enumerate(st.session_state.materials):
     with st.container(border=True):
-        # 유형 선택 & 삭제 버튼을 한 줄로 배치하고 싶으면 columns 사용 가능
-        top_cols = st.columns([1, 0.2])
+        # 상단: 유형 선택 + 순서/삭제
+        top_cols = st.columns([1.2, 0.2, 0.2, 0.2])
         with top_cols[0]:
             item["kind"] = st.selectbox(
                 "자료 유형",
-                ["성경 구절", "이미지", "기타 파일"],
-                index=["성경 구절", "이미지", "기타 파일"].index(item.get("kind", "성경 구절")),
+                ["성경 구절", "이미지", "기타 파일", "설교 전문"],
+                index=["성경 구절", "이미지", "기타 파일", "설교 전문"].index(item.get("kind", "성경 구절")),
                 key=f"kind_{item['id']}",
                 disabled=not can_edit
             )
         with top_cols[1]:
-            st.write("")  # spacing
+            st.write("")
+            st.button("▲", key=f"up_{item['id']}", disabled=(not can_edit or i == 0), on_click=move_material, args=(item["id"], "up"))
+        with top_cols[2]:
+            st.write("")
+            st.button("▼", key=f"down_{item['id']}", disabled=(not can_edit or i == len(st.session_state.materials)-1), on_click=move_material, args=(item["id"], "down"))
+        with top_cols[3]:
+            st.write("")
             if st.button("삭제", key=f"del_{item['id']}", disabled=not can_edit):
                 to_remove.append(item["id"])
 
+        # 본문 입력 영역
         if item["kind"] == "성경 구절":
             item["verse_text"] = st.text_area(
                 "성경 구절 입력 (예: 요한복음 3:16)",
@@ -363,19 +399,22 @@ for i, item in enumerate(st.session_state.materials):
                 height=120,
                 disabled=not can_edit
             )
+            item["files"] = []
             item["file"] = None
 
         elif item["kind"] == "이미지":
-            item["file"] = st.file_uploader(
-                "이미지 업로드 (PNG/JPG)",
+            # 다중 업로드
+            item["files"] = st.file_uploader(
+                "이미지 업로드 (PNG/JPG) — 여러 장 선택 가능",
                 type=["png", "jpg", "jpeg"],
-                key=f"file_{item['id']}",
-                accept_multiple_files=False,
+                key=f"files_{item['id']}",
+                accept_multiple_files=True,
                 disabled=not can_edit
             )
             item["verse_text"] = ""
+            item["file"] = None  # 단일 파일은 사용 안 함(과거 호환만)
 
-        else:  # 기타 파일
+        elif item["kind"] == "기타 파일":
             item["file"] = st.file_uploader(
                 "기타 파일 업로드",
                 type=None,
@@ -384,13 +423,27 @@ for i, item in enumerate(st.session_state.materials):
                 disabled=not can_edit
             )
             item["verse_text"] = ""
+            item["files"] = []
 
+        elif item["kind"] == "설교 전문":
+            item["full_text"] = st.text_area(
+                "설교 전문 입력 (줄바꿈 유지 / **굵게**, ==형광펜== 지원)",
+                value=item.get("full_text", ""),
+                key=f"full_{item['id']}",
+                height=300,
+                disabled=not can_edit
+            )
+            item["verse_text"] = ""
+            item["files"] = []
+            item["file"] = None
+
+        # 설명(스토리보드): 마크업 안내
         item["description"] = st.text_area(
             "설명(스토리보드)",
             value=item.get("description", ""),
             key=f"desc_{item['id']}",
             height=100,
-            placeholder="해당 자료의 노출 타이밍, 강조를 원하시는 부분 등을 적어주세요.",
+            placeholder="노출 타이밍, 강조 부분 등. **굵게**, ==형광펜== 으로 강조 가능합니다.",
             disabled=not can_edit
         )
 
@@ -402,82 +455,7 @@ if to_remove and can_edit:
 st.divider()
 
 # ---------------------------
-# 🔎 라이브 프리뷰 (4608:2240)
-# ---------------------------
-st.markdown("<div class='section-title'>🔎 라이브 프리뷰 (4608:2240 자막 화면)</div>", unsafe_allow_html=True)
-
-# 프리뷰 스타일 슬라이더 (읽기전용이라도 조작은 가능하도록 유지하려면 disabled=False로 두세요)
-colA, colB = st.columns([1, 1])
-with colA:
-    fs = st.slider("글자 크기(px)", 24, 96, 48, help="자막 폰트 크기")
-    lh = st.slider("줄간격(line-height)", 1.0, 2.0, 1.3, 0.1)
-with colB:
-    bottom_padding = st.slider("하단 여백(px)", 0, 200, 40)
-    max_width = st.slider("자막 최대 너비(%)", 40, 100, 80)
-
-# 장면 생성
-preview_frames = build_preview_frames(st.session_state.materials)
-
-# 네비게이션
-nav1, nav2, nav3 = st.columns([1, 2, 1])
-with nav1:
-    if st.button("◀ 이전"):
-        st.session_state.preview_idx = (st.session_state.preview_idx - 1) % len(preview_frames)
-with nav3:
-    if st.button("다음 ▶"):
-        st.session_state.preview_idx = (st.session_state.preview_idx + 1) % len(preview_frames)
-
-cur = st.session_state.preview_idx
-st.caption(f"장면 {cur+1} / {len(preview_frames)}")
-
-# 4608:2240 스테이지 (CSS aspect-ratio 사용)
-stage = preview_frames[cur]
-bg_style = "background:#000;"  # 기본 검은 배경
-if stage["bg"]:
-    bg_style = f"background: url({stage['bg']}) center/cover no-repeat, #000;"
-
-stage_html = f"""
-<div style="
-  position:relative;
-  width:100%;
-  max-width: 1920px; /* 표시 폭 제한(필요 시 조정) */
-  aspect-ratio: 4608 / 2240;
-  margin: 0 auto;
-  border-radius: 12px;
-  overflow:hidden;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-  {bg_style}
-">
-  <!-- 자막 박스 -->
-  <div style="
-    position:absolute; left:0; right:0; bottom:{bottom_padding}px;
-    display:flex; justify-content:center;
-  ">
-    <div style="
-      max-width:{max_width}%;
-      padding: 12px 18px;
-      background: rgba(0,0,0,0.6);
-      color:#fff;
-      font-weight:600;
-      font-size:{fs}px;
-      line-height:{lh};
-      text-align:center;
-      border-radius: 10px;
-      text-shadow: 0 2px 8px rgba(0,0,0,0.85);
-      white-space:pre-wrap;
-    ">{stage["caption"]}</div>
-  </div>
-</div>
-"""
-st.markdown(stage_html, unsafe_allow_html=True)
-
-with st.expander("전체 화면으로 띄우는 팁"):
-    st.info("브라우저에서 [F11] 전체화면을 활용하거나, 앱을 새 창으로 열어 프리뷰만 크게 띄워서 송출 화면처럼 사용할 수 있습니다.")
-
-st.divider()
-
-# ---------------------------
-# 업로드(Word 저장) 실행
+# 업로드(Word 저장)
 # ---------------------------
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -509,8 +487,9 @@ st.markdown(
     """
     <hr/>
     <div class='small-note'>
-    ⚙️ 팁: 이미지 외의 기타 파일은 Word에 직접 삽입되지 않으며, 파일명과 설명이 기록됩니다. 필요 시 Zip 묶음으로 함께 배포하세요.<br>
-    🖨️ 출력은 Word에서 페이지 여백/서식을 조정해 인쇄하면 보기 좋습니다.
+    ⚙️ 이미지 외의 기타 파일은 Word에 직접 삽입되지 않으며, 파일명과 설명이 기록됩니다.<br>
+    🖨️ 출력은 Word에서 페이지 여백/서식을 조정해 인쇄하면 보기 좋습니다.<br>
+    ✍️ 강조법: **굵게**, ==형광펜== (Word 변환 시 자동 적용)
     </div>
     """,
     unsafe_allow_html=True
