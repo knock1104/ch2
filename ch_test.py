@@ -35,6 +35,39 @@ import requests
 from datetime import date, datetime, timezone
 from typing import List, Dict, Any
 
+import hashlib
+import mimetypes
+
+def sanitize_filename(name: str) -> str:
+    name = os.path.basename(name or "upload.bin")
+    return name.replace("/", "_").replace("\\", "_").strip()
+
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def upload_streamlit_file_to_github(uploaded_file, dest_dir: str, msg_prefix: str = "[file]") -> dict:
+    """
+    Streamlit UploadedFile -> GitHub에 저장 후 메타데이터 반환
+    반환 예: {"name": "...", "path": "...", "size": 1234, "content_type": "image/png", "sha1": "..."}
+    """
+    if uploaded_file is None:
+        return {}
+    data = uploaded_file.getvalue()
+    sha1 = _sha1(data)
+    orig_name = getattr(uploaded_file, "name", "upload.bin")
+    safe_name = sanitize_filename(orig_name)
+    # 중복 방지를 위해 해시 prefix 붙이기
+    dest_path = f"{dest_dir}/{sha1[:10]}_{safe_name}"
+    # 업로드
+    gh_put_bytes(dest_path, data, message=f"{msg_prefix} upload {safe_name}")
+    return {
+        "name": orig_name,
+        "path": dest_path,
+        "size": len(data),
+        "content_type": getattr(uploaded_file, "type", mimetypes.guess_type(orig_name)[0]),
+        "sha1": sha1,
+    }
+
 # python-docx / PIL
 try:
     from docx import Document
