@@ -7,7 +7,7 @@ Streamlit 예배 자료 업로드 + Word 저장 (개편+저장/제출 버전)
 3) 라이브 프리뷰 삭제
 4) 이미지 여러 장 업로드
 5) 설명 강조(**굵게**, ==형광펜==) -> Word 반영
-6) 자료 유형 '설교 전문' 추가
+6) 자료 유형 '텍스트' 추가
 7) 임시 저장/불러오기/제출(GitHub Contents API)
 """
 
@@ -162,12 +162,12 @@ st.markdown(
 def add_material():
     st.session_state.materials.append({
         "id": str(uuid.uuid4()),
-        "kind": "성경 구절",     # "성경 구절" | "이미지" | "기타 파일" | "설교 전문"
+        "kind": "성경 구절",     # "성경 구절" | "이미지" | "기타 파일" | "텍스트"
         "files": [],             # 이미지 다중 업로드용
         "file": None,            # 과거 호환(단일 파일)
         "verse_text": "",
         "description": "",
-        "full_text": ""          # 설교 전문
+        "full_text": ""          # 텍스트
     })
 
 def remove_material(mid: str):
@@ -222,7 +222,7 @@ def build_docx(
     position: str,
     role: str,
 ) -> bytes:
-    """문서(.docx) 생성 후 바이트로 반환 (설교 전문/강조 마크업 반영 버전)"""
+    """문서(.docx) 생성 후 바이트로 반환 (텍스트/강조 마크업 반영 버전)"""
     if Document is None:
         raise RuntimeError("python-docx가 설치되지 않았습니다. 'pip install python-docx' 실행 후 다시 시도해주세요.")
 
@@ -305,13 +305,13 @@ def build_docx(
                 else:
                     doc.add_paragraph("(첨부 파일 없음)")
 
-            elif kind == "설교 전문":
+            elif kind == "텍스트":
                 if full_text.strip():
                     for line in full_text.splitlines():
                         p = doc.add_paragraph()
                         add_rich_text(p, line)
                 else:
-                    doc.add_paragraph("(설교 전문 미입력)")
+                    doc.add_paragraph("(텍스트 미입력)")
 
             # 공통: 설명(스토리보드) — 마크업 반영
             p = doc.add_paragraph()
@@ -458,7 +458,7 @@ services = st.session_state.services_selected
 # ---------------------------
 # ③ 자료 추가 (순서 조절 포함)
 # ---------------------------
-st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/텍스트)</div>", unsafe_allow_html=True)
 st.caption("• 설명(스토리보드)에서 **굵게**, ==형광펜== 으로 강조하면 Word에 그대로 반영됩니다.")
 
 add_btn = st.button("+ 자료 추가", disabled=not can_edit)
@@ -473,8 +473,8 @@ for i, item in enumerate(st.session_state.materials):
         with top_cols[0]:
             item["kind"] = st.selectbox(
                 "자료 유형",
-                ["성경 구절", "이미지", "기타 파일", "설교 전문"],
-                index=["성경 구절", "이미지", "기타 파일", "설교 전문"].index(item.get("kind", "성경 구절")),
+                ["성경 구절", "이미지", "기타 파일", "텍스트"],
+                index=["성경 구절", "이미지", "기타 파일", "텍스트"].index(item.get("kind", "성경 구절")),
                 key=f"kind_{item['id']}",
                 disabled=not can_edit
             )
@@ -524,9 +524,9 @@ for i, item in enumerate(st.session_state.materials):
             item["verse_text"] = ""
             item["files"] = []
 
-        elif item["kind"] == "설교 전문":
+        elif item["kind"] == "텍스트":
             item["full_text"] = st.text_area(
-                "설교 전문 입력 (줄바꿈 유지 / **굵게**, ==형광펜== 지원)",
+                "텍스트 입력 (줄바꿈 유지 / **굵게**, ==형광펜== 지원)",
                 value=item.get("full_text", ""),
                 key=f"full_{item['id']}",
                 height=300,
