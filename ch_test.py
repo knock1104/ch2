@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit 예배 자료 업로드 + Word 저장 (개편 버전)
+Streamlit 예배 자료 업로드 + Word 저장 (개편+저장/제출 버전)
 요청 반영:
 1) 예배 구분 직접기입
 2) 자료 순서 조절
@@ -8,182 +8,34 @@ Streamlit 예배 자료 업로드 + Word 저장 (개편 버전)
 4) 이미지 여러 장 업로드
 5) 설명 강조(**굵게**, ==형광펜==) -> Word 반영
 6) 자료 유형 '설교 전문' 추가
+7) 임시 저장/불러오기/제출(GitHub Contents API)
 """
 
+# ---------------------------
+# 페이지 설정 (최상단)
+# ---------------------------
+import streamlit as st
+st.set_page_config(
+    page_title="설교 자료 업로드",
+    page_icon="🙏",
+    layout="wide"
+)
+
+# ---------------------------
+# 표준 라이브러리 / 서드파티
+# ---------------------------
 import io
 import os
 import uuid
 import base64
 import tempfile
 import re
-from datetime import date
-from typing import List, Dict, Any
-import streamlit as st
 import json
 import requests
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from typing import List, Dict, Any
 
-def _gh_headers():
-    return {
-        "Authorization": f"token {st.secrets['GITHUB_TOKEN']}",
-        "Accept":"application/vnd.github+json",
-    }
-
-def _gh_api_base():
-    owner = st.secrets["GITHUB_OWNER"]
-    repo = st.secrets["GITHUB_REPO"]
-    return f"https://api.github.com/repos/{owner}/{repo}"
-
-def gh_put_bytes(path: str, content_bytes: bytes, message: str):
-    """
-    GitHub Contents API로 파일 생성/업데이트
-    """
-    api = _gh_api_base()
-    url = f"{api}/contents/{path}"
-    # 기존 sha 조회(업데이트 대비)
-    get = requests.get(url, headers=_gh_headers())
-    sha = get.json().get("sha") if get.status_code == 200 else None
-
-    b64 = base64.b64encode(content_bytes).decode("utf-8")
-    payload = {
-        "message": message,
-        "content": b64,
-        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
-    }
-    if sha:
-        payload["sha"] = sha
-
-    r = requests.put(url, headers=_gh_headers(), json=payload)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub 업로드 실패: {r.status_code} {r.text}")
-    return r.json()
-
-def gh_get_bytes(path: str) -> bytes:
-    api = _gh_api_base()
-    url = f"{api}/contents/{path}"
-    r = requests.get(url, headers=_gh_headers())
-    if r.status_code != 200:
-        raise FileNotFoundError(f"GitHub 파일 없음: {path}")
-    content = r.json()["content"]
-    return base64.b64decode(content)
-
-def gh_list_dir(path: str):
-    api = _gh_api_base()
-    url = f"{api}/contents/{path}"
-    r = requests.get(url, headers=_gh_headers())
-    if r.status_code != 200:
-        return []  # 폴더 없을 수 있음(초기)
-    return r.json()  # list of items (name, path, type, sha ...)
-
-# ---------------------------
-# 제출 데이터 직렬화/역직렬화
-# ---------------------------
-def serialize_submission():
-    return {
-        "worship_date": str(st.session_state.get("worship_date")),
-        "services": st.session_state.get("services_selected", []),
-        "materials": st.session_state.get("materials", []),
-        "user_name": st.session_state.get("user_name"),
-        "position": st.session_state.get("position"),
-        "role": st.session_state.get("role"),
-        "saved_at": datetime.now(timezone.utc).isoformat()
-    }
-
-def load_into_session(payload: dict):
-    st.session_state.worship_date = date.fromisoformat(payload.get("worship_date"))
-    st.session_state.services_selected = payload.get("services", [])
-    st.session_state.materials = payload.get("materials", [])
-    # 작성자/권한은 현재 세션값 유지
-
-# ---------------------------
-# 경로 규칙 (draft / submitted)
-# ---------------------------
-def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
-    base = st.secrets.get("GITHUB_BASE_DIR", "worship_submissions")
-    d = worship_date.strftime("%Y-%m-%d")
-    safe_user = (user_name or "unknown").strip().replace("/", "_")
-    if submission_id is None:
-        # 고정 키 (임시저장 전용)
-        sub_id = "draft"
-    else:
-        sub_id = submission_id
-
-    folder = f"{base}/{d}/{safe_user}/{sub_id}"
-    return {
-        "json": f"{folder}/submission.json",
-        "docx": f"{folder}/submission.docx"
-    }
-
-# 날짜를 세션에 보관 (직렬화용)
-st.session_state.worship_date = worship_date
-
-st.markdown("#### 저장/제출")
-
-btn_cols = st.columns([1,1,1,2])
-with btn_cols[0]:
-    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
-with btn_cols[1]:
-    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
-with btn_cols[2]:
-    submit_now = st.button("✅ 제출", disabled=not can_edit)  # 제출 후 미디어부가 확인
-
-# 제출 ID(제출 시 고정)
-if "submission_id" not in st.session_state:
-    st.session_state.submission_id = None
-
-if save_draft and can_edit:
-    try:
-        # JSON 저장
-        data = serialize_submission()
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        gh_put_bytes(p["json"], json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                     message=f"[draft] {st.session_state.user_name} {worship_date} 저장")
-        st.success("임시 저장되었습니다. (GitHub)")
-    except Exception as e:
-        st.error(f"임시 저장 실패: {e}")
-
-if load_draft and can_edit:
-    try:
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        draft_bytes = gh_get_bytes(p["json"])
-        payload = json.loads(draft_bytes.decode("utf-8"))
-        load_into_session(payload)
-        st.success("임시 저장본을 불러왔습니다.")
-        st.rerun()
-    except Exception as e:
-        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
-
-if submit_now and can_edit:
-    try:
-        # 1) docx 생성
-        docx_bytes = build_docx(
-            worship_date=worship_date,
-            services=st.session_state.services_selected,
-            materials=st.session_state.materials,
-            user_name=st.session_state.user_name,
-            position=st.session_state.position,
-            role=st.session_state.role
-        )
-        # 2) JSON + DOCX 업로드 (제출용 고유 ID 생성)
-        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        st.session_state.submission_id = sub_id
-        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
-
-        data = serialize_submission()
-        data["status"] = "submitted"
-        data["submission_id"] = sub_id
-
-        gh_put_bytes(p["json"], json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                     message=f"[submit] {st.session_state.user_name} {worship_date} 제출")
-        gh_put_bytes(p["docx"], docx_bytes,
-                     message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX")
-
-        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
-    except Exception as e:
-        st.error(f"제출 실패: {e}")
-
-
-# python-docx 관련 모듈 로드 (미설치 시 안내)
+# python-docx / PIL
 try:
     from docx import Document
     from docx.shared import Inches, Pt
@@ -199,14 +51,8 @@ except Exception:
     Image = None
 
 # ---------------------------
-# 페이지 설정 & 스타일
+# 스타일
 # ---------------------------
-st.set_page_config(
-    page_title="설교 자료 업로드",
-    page_icon="🙏",
-    layout="wide"
-)
-
 st.markdown(
     """
     <style>
@@ -233,7 +79,7 @@ if "materials" not in st.session_state:
     st.session_state.materials: List[Dict[str, Any]] = []
 
 if "preview_idx" not in st.session_state:
-    st.session_state.preview_idx = 0  # (프리뷰는 제거되었지만 호환을 위해 유지)
+    st.session_state.preview_idx = 0  # (프리뷰 제거, 호환 유지)
 
 # 권한/사용자 상태
 if "authenticated" not in st.session_state:
@@ -255,7 +101,63 @@ if "services_selected" not in st.session_state:
     st.session_state.services_selected: List[str] = []
 
 # ---------------------------
-# 유틸 함수
+# 0) 랜딩 페이지 (권한/접근 제어)
+# ---------------------------
+def render_landing():
+    st.title("Ch2 설교 자료 업로더")
+    st.markdown(
+        "<div class='landing-card'>"
+        "<b>역할을 선택하고 입장하세요.</b><br>"
+        "교역자는 작성/수정이 가능하며, 미디어부는 확인만 가능합니다.<br>"
+        "<span class='small-note'>[테스트 안내] 현재는 모든 액세스 코드가 <b>0001</b>이면 입장 가능합니다.</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+    st.write("")
+
+    with st.form("landing_form"):
+        role = st.radio("역할 선택", ["교역자", "미디어부"], horizontal=True)
+        cols = st.columns(2)
+        with cols[0]:
+            user_name = st.text_input("이름")
+        with cols[1]:
+            position = st.selectbox(
+                "직분 선택",
+                ['원로목사', "담임목사", "부목사", '강도사', "전도사", "미디어부"],
+                index=2
+            )
+        access_code = st.text_input("개인 액세스 코드", type="password", placeholder="예) 0001")
+        submitted = st.form_submit_button("입장")
+
+    if submitted:
+        if access_code == "0001":
+            st.session_state.authenticated = True
+            st.session_state.role = role
+            st.session_state.user_name = user_name.strip()
+            st.session_state.position = position
+            st.session_state.can_edit = (role == "교역자")
+            st.success("입장되었습니다.")
+            st.rerun()
+        else:
+            st.error("액세스 코드가 올바르지 않습니다. (테스트: 0001)")
+
+if not st.session_state.authenticated:
+    render_landing()
+    st.stop()
+
+# ---------------------------
+# 상단 사용자/권한 표시
+# ---------------------------
+can_edit = st.session_state.get("can_edit", False)
+role_badge = "🟢 편집 가능" if can_edit else "🔒 읽기 전용(확인만)"
+st.markdown(
+    f"**접속자:** {st.session_state.user_name or '이름 미입력'} "
+    f"({st.session_state.position or '직분 미선택'}) · "
+    f"{st.session_state.role} · {role_badge}"
+)
+
+# ---------------------------
+# 유틸 함수 (자료 편집)
 # ---------------------------
 def add_material():
     st.session_state.materials.append({
@@ -275,7 +177,7 @@ def move_material(mid: str, direction: str):
     """direction: 'up' or 'down'"""
     mats = st.session_state.materials
     idx = next((i for i, m in enumerate(mats) if m["id"] == mid), None)
-    if idx is None: 
+    if idx is None:
         return
     if direction == "up" and idx > 0:
         mats[idx-1], mats[idx] = mats[idx], mats[idx-1]
@@ -428,157 +330,108 @@ def build_docx(
     return buffer.read()
 
 # ---------------------------
-# 0) 랜딩 페이지 (권한/접근 제어)
+# GitHub 저장/불러오기 유틸
 # ---------------------------
-def render_landing():
-    st.title("Ch2 설교 자료 업로더")
-    st.markdown(
-        "<div class='landing-card'>"
-        "<b>역할을 선택하고 입장하세요.</b><br>"
-        "교역자는 작성/수정이 가능하며, 미디어부는 확인만 가능합니다.<br>"
-        "<span class='small-note'>[테스트 안내] 현재는 모든 액세스 코드가 <b>0001</b>이면 입장 가능합니다.</span>"
-        "</div>",
-        unsafe_allow_html=True
-    )
-    st.write("")
+def _gh_headers():
+    return {
+        "Authorization": f"token {st.secrets['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+    }
 
-    with st.form("landing_form"):
-        role = st.radio("역할 선택", ["교역자", "미디어부"], horizontal=True)
-        cols = st.columns(2)
-        with cols[0]:
-            user_name = st.text_input("이름")
-        with cols[1]:
-            position = st.selectbox(
-                "직분 선택",
-                ['원로목사', "담임목사", "부목사", '강도사', "전도사", "미디어부"],
-                index=2
-            )
-        access_code = st.text_input("개인 액세스 코드", type="password", placeholder="예) 0001")
-        submitted = st.form_submit_button("입장")
+def _gh_api_base():
+    owner = st.secrets["GITHUB_OWNER"]
+    repo = st.secrets["GITHUB_REPO"]
+    return f"https://api.github.com/repos/{owner}/{repo}"
 
-    if submitted:
-        if access_code == "0001":
-            st.session_state.authenticated = True
-            st.session_state.role = role
-            st.session_state.user_name = user_name.strip()
-            st.session_state.position = position
-            st.session_state.can_edit = (role == "교역자")
-            st.success("입장되었습니다.")
-            st.rerun()
-        else:
-            st.error("액세스 코드가 올바르지 않습니다. (테스트: 0001)")
+def gh_put_bytes(path: str, content_bytes: bytes, message: str):
+    """
+    GitHub Contents API로 파일 생성/업데이트
+    """
+    api = _gh_api_base()
+    url = f"{api}/contents/{path}"
+    # 기존 sha 조회(업데이트 대비)
+    get = requests.get(url, headers=_gh_headers())
+    sha = get.json().get("sha") if get.status_code == 200 else None
 
-if not st.session_state.authenticated:
-    render_landing()
-    st.stop()
+    b64 = base64.b64encode(content_bytes).decode("utf-8")
+    payload = {
+        "message": message,
+        "content": b64,
+        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+    }
+    if sha:
+        payload["sha"] = sha
 
-# ---------------------------
-# 상단 사용자/권한 표시
-# ---------------------------
-can_edit = st.session_state.get("can_edit", False)
-role_badge = "🟢 편집 가능" if can_edit else "🔒 읽기 전용(확인만)"
-st.markdown(
-    f"**접속자:** {st.session_state.user_name or '이름 미입력'} "
-    f"({st.session_state.position or '직분 미선택'}) · "
-    f"{st.session_state.role} · {role_badge}"
-)
-# ---------------------------
-# 미디어부 전용 제출함
-# ---------------------------
-if st.session_state.role == "미디어부":
-    st.divider()
-    st.markdown("### 📬 제출함(미디어부) — 날짜별/제출자별 목록")
+    r = requests.put(url, headers=_gh_headers(), json=payload)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub 업로드 실패: {r.status_code} {r.text}")
+    return r.json()
 
+def gh_get_bytes(path: str) -> bytes:
+    api = _gh_api_base()
+    url = f"{api}/contents/{path}"
+    r = requests.get(url, headers=_gh_headers())
+    if r.status_code != 200:
+        raise FileNotFoundError(f"GitHub 파일 없음: {path}")
+    content = r.json()["content"]
+    return base64.b64decode(content)
+
+def gh_list_dir(path: str):
+    api = _gh_api_base()
+    url = f"{api}/contents/{path}"
+    r = requests.get(url, headers=_gh_headers())
+    if r.status_code != 200:
+        return []  # 폴더 없을 수 있음(초기)
+    return r.json()  # list of items (name, path, type, sha ...)
+
+# 제출 데이터 직렬화/역직렬화
+def serialize_submission():
+    return {
+        "worship_date": str(st.session_state.get("worship_date")),
+        "services": st.session_state.get("services_selected", []),
+        "materials": st.session_state.get("materials", []),
+        "user_name": st.session_state.get("user_name"),
+        "position": st.session_state.get("position"),
+        "role": st.session_state.get("role"),
+        "saved_at": datetime.now(timezone.utc).isoformat()
+    }
+
+def load_into_session(payload: dict):
+    st.session_state.worship_date = date.fromisoformat(payload.get("worship_date"))
+    st.session_state.services_selected = payload.get("services", [])
+    st.session_state.materials = payload.get("materials", [])
+    # 작성자/권한은 현재 세션값 유지
+
+# 경로 규칙 (draft / submitted)
+def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
     base = st.secrets.get("GITHUB_BASE_DIR", "worship_submissions")
-    # 1) 날짜 디렉토리 나열
-    days = gh_list_dir(base)
-    if not days:
-        st.info("아직 제출된 자료가 없습니다.")
-    else:
-        # 최근 날짜가 위로 오도록
-        day_names = sorted([d["name"] for d in days if d["type"] == "dir"], reverse=True)
-        sel_day = st.selectbox("날짜 선택", options=day_names)
-        if sel_day:
-            day_dir = f"{base}/{sel_day}"
-            users = gh_list_dir(day_dir)
-            for u in users:
-                if u["type"] != "dir":
-                    continue
-                with st.expander(f"👤 {u['name']} — {sel_day} 제출물들"):
-                    subs = gh_list_dir(u["path"])  # submission_id 디렉토리들
-                    for s in subs:
-                        if s["type"] != "dir":
-                            continue
-                        files = gh_list_dir(s["path"])
-                        json_item = next((f for f in files if f["name"]=="submission.json"), None)
-                        docx_item = next((f for f in files if f["name"]=="submission.docx"), None)
-
-                        cols = st.columns([2,1,2])
-                        with cols[0]:
-                            st.markdown(f"**제출 ID:** {s['name']}")
-                        with cols[1]:
-                            if json_item:
-                                # JSON 보기(요약)
-                                try:
-                                    payload = json.loads(gh_get_bytes(json_item["path"]).decode("utf-8"))
-                                    info = f"- 예배: {', '.join(payload.get('services', [])) or '(미지정)'}\n" \
-                                           f"- 자료개수: {len(payload.get('materials', []))}\n" \
-                                           f"- 제출시각(UTC): {payload.get('saved_at','')}\n"
-                                    st.caption(info)
-                                except Exception:
-                                    st.caption("메타 로드 실패")
-                            else:
-                                st.caption("메타 없음")
-
-                        with cols[2]:
-                            # Word 다운로드 버튼
-                            if docx_item:
-                                try:
-                                    docx_bytes = gh_get_bytes(docx_item["path"])
-                                    st.download_button(
-                                        "⬇️ Word 다운로드",
-                                        data=docx_bytes,
-                                        file_name=f"설교자료_{sel_day}_{u['name']}_{s['name']}.docx",
-                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                        key=f"dl_{sel_day}_{u['name']}_{s['name']}"
-                                    )
-                                except Exception as e:
-                                    st.error(f"다운로드 오류: {e}")
-                            else:
-                                # JSON만 있고 DOCX 없는 제출물도 고려 → 즉석 변환 버튼 제공
-                                if json_item and Document is not None:
-                                    if st.button("📄 즉석 Word 생성", key=f"mk_{sel_day}_{u['name']}_{s['name']}"):
-                                        try:
-                                            payload = json.loads(gh_get_bytes(json_item["path"]).decode("utf-8"))
-                                            # JSON → Word 재생성
-                                            docx_bytes2 = build_docx(
-                                                worship_date=date.fromisoformat(sel_day),
-                                                services=payload.get("services", []),
-                                                materials=payload.get("materials", []),
-                                                user_name=payload.get("user_name"),
-                                                position=payload.get("position"),
-                                                role=payload.get("role")
-                                            )
-                                            st.download_button(
-                                                "⬇️ Word 다운로드(즉석)",
-                                                data=docx_bytes2,
-                                                file_name=f"설교자료_{sel_day}_{u['name']}_{s['name']}.docx",
-                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                                key=f"dl2_{sel_day}_{u['name']}_{s['name']}"
-                                            )
-                                        except Exception as e:
-                                            st.error(f"생성 오류: {e}")
+    d = worship_date.strftime("%Y-%m-%d")
+    safe_user = (user_name or "unknown").strip().replace("/", "_")
+    sub_id = "draft" if submission_id is None else submission_id
+    folder = f"{base}/{d}/{safe_user}/{sub_id}"
+    return {
+        "json": f"{folder}/submission.json",
+        "docx": f"{folder}/submission.docx"
+    }
 
 # ---------------------------
 # ① 날짜/예배 선택
 # ---------------------------
 st.markdown("<div class='section-title'>① 날짜/예배 선택</div>", unsafe_allow_html=True)
+
+# 세션의 worship_date 초기화(안전 가드)
+if "worship_date" not in st.session_state:
+    st.session_state.worship_date = date.today()
+
 worship_date = st.date_input(
     "예배 날짜",
-    value=date.today(),
+    value=st.session_state.worship_date,
     format="YYYY-MM-DD",
     disabled=not can_edit
 )
+
+# 최신 선택값을 세션에 반영 (← 여기 순서가 매우 중요!)
+st.session_state.worship_date = worship_date
 
 # 예배 구분: 기본 옵션 + 직접 입력 추가
 col_sv1, col_sv2 = st.columns([2, 1])
@@ -602,10 +455,85 @@ with col_sv2:
 
 services = st.session_state.services_selected
 
+# ---------------------------
+# ② 저장/불러오기/제출 (날짜 정의 이후 위치!)
+# ---------------------------
+st.markdown("#### 저장/제출")
+btn_cols = st.columns([1, 1, 1, 2])
+with btn_cols[0]:
+    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
+with btn_cols[1]:
+    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
+with btn_cols[2]:
+    submit_now = st.button("✅ 제출", disabled=not can_edit)  # 제출 후 미디어부가 확인
+
+# 제출 ID(제출 시 고정)
+if "submission_id" not in st.session_state:
+    st.session_state.submission_id = None
+
+if save_draft and can_edit:
+    try:
+        data = serialize_submission()
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[draft] {st.session_state.user_name} {worship_date} 저장"
+        )
+        st.success("임시 저장되었습니다. (GitHub)")
+    except Exception as e:
+        st.error(f"임시 저장 실패: {e}")
+
+if load_draft and can_edit:
+    try:
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        draft_bytes = gh_get_bytes(p["json"])
+        payload = json.loads(draft_bytes.decode("utf-8"))
+        load_into_session(payload)
+        st.success("임시 저장본을 불러왔습니다.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
+
+if submit_now and can_edit:
+    try:
+        # 1) docx 생성
+        docx_bytes = build_docx(
+            worship_date=worship_date,
+            services=st.session_state.services_selected,
+            materials=st.session_state.materials,
+            user_name=st.session_state.user_name,
+            position=st.session_state.position,
+            role=st.session_state.role
+        )
+        # 2) JSON + DOCX 업로드 (제출용 고유 ID 생성)
+        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        st.session_state.submission_id = sub_id
+        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
+
+        data = serialize_submission()
+        data["status"] = "submitted"
+        data["submission_id"] = sub_id
+
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[submit] {st.session_state.user_name} {worship_date} 제출"
+        )
+        gh_put_bytes(
+            p["docx"],
+            docx_bytes,
+            message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX"
+        )
+
+        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
+    except Exception as e:
+        st.error(f"제출 실패: {e}")
+
 st.divider()
 
 # ---------------------------
-# ② 자료 추가 (순서 조절 포함)
+# ③ 자료 추가 (순서 조절 포함)
 # ---------------------------
 st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
 st.caption("• 설명(스토리보드)에서 **굵게**, ==형광펜== 으로 강조하면 Word에 그대로 반영됩니다.")
@@ -703,7 +631,7 @@ if to_remove and can_edit:
 st.divider()
 
 # ---------------------------
-# 업로드(Word 저장)
+# ④ 업로드(Word 저장)
 # ---------------------------
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -730,7 +658,93 @@ if do_save and can_edit:
     except Exception as e:
         st.error(f"문서 생성 중 오류가 발생했습니다: {e}")
 
+# ---------------------------
+# ⑤ 미디어부 전용 제출함 (유틸/날짜 정의 이후여야 함)
+# ---------------------------
+if st.session_state.role == "미디어부":
+    st.divider()
+    st.markdown("### 📬 제출함(미디어부) — 날짜별/제출자별 목록")
+
+    base = st.secrets.get("GITHUB_BASE_DIR", "worship_submissions")
+    days = gh_list_dir(base)
+    if not days:
+        st.info("아직 제출된 자료가 없습니다.")
+    else:
+        day_names = sorted([d["name"] for d in days if d["type"] == "dir"], reverse=True)
+        sel_day = st.selectbox("날짜 선택", options=day_names)
+        if sel_day:
+            day_dir = f"{base}/{sel_day}"
+            users = gh_list_dir(day_dir) or []
+            for u in users:
+                if u.get("type") != "dir":
+                    continue
+                with st.expander(f"👤 {u['name']} — {sel_day} 제출물들"):
+                    subs = gh_list_dir(u["path"]) or []  # submission_id 디렉토리들
+                    for s in subs:
+                        if s.get("type") != "dir":
+                            continue
+                        files = gh_list_dir(s["path"]) or []
+                        json_item = next((f for f in files if f.get("name") == "submission.json"), None)
+                        docx_item = next((f for f in files if f.get("name") == "submission.docx"), None)
+
+                        cols = st.columns([2, 1, 2])
+                        with cols[0]:
+                            st.markdown(f"**제출 ID:** {s['name']}")
+                        with cols[1]:
+                            if json_item:
+                                try:
+                                    payload = json.loads(gh_get_bytes(json_item["path"]).decode("utf-8"))
+                                    info = (
+                                        f"- 예배: {', '.join(payload.get('services', [])) or '(미지정)'}\n"
+                                        f"- 자료개수: {len(payload.get('materials', []))}\n"
+                                        f"- 제출시각(UTC): {payload.get('saved_at','')}\n"
+                                    )
+                                    st.caption(info)
+                                except Exception:
+                                    st.caption("메타 로드 실패")
+                            else:
+                                st.caption("메타 없음")
+
+                        with cols[2]:
+                            if docx_item:
+                                try:
+                                    docx_bytes = gh_get_bytes(docx_item["path"])
+                                    st.download_button(
+                                        "⬇️ Word 다운로드",
+                                        data=docx_bytes,
+                                        file_name=f"설교자료_{sel_day}_{u['name']}_{s['name']}.docx",
+                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        key=f"dl_{sel_day}_{u['name']}_{s['name']}"
+                                    )
+                                except Exception as e:
+                                    st.error(f"다운로드 오류: {e}")
+                            else:
+                                # JSON만 있고 DOCX 없는 제출물도 고려 → 즉석 변환
+                                if json_item and Document is not None:
+                                    if st.button("📄 즉석 Word 생성", key=f"mk_{sel_day}_{u['name']}_{s['name']}"):
+                                        try:
+                                            payload = json.loads(gh_get_bytes(json_item["path"]).decode("utf-8"))
+                                            docx_bytes2 = build_docx(
+                                                worship_date=date.fromisoformat(sel_day),
+                                                services=payload.get("services", []),
+                                                materials=payload.get("materials", []),
+                                                user_name=payload.get("user_name"),
+                                                position=payload.get("position"),
+                                                role=payload.get("role")
+                                            )
+                                            st.download_button(
+                                                "⬇️ Word 다운로드(즉석)",
+                                                data=docx_bytes2,
+                                                file_name=f"설교자료_{sel_day}_{u['name']}_{s['name']}.docx",
+                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                                key=f"dl2_{sel_day}_{u['name']}_{s['name']}"
+                                            )
+                                        except Exception as e:
+                                            st.error(f"생성 오류: {e}")
+
+# ---------------------------
 # 풋터
+# ---------------------------
 st.markdown(
     """
     <hr/>
