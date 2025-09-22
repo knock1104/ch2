@@ -456,83 +456,6 @@ with col_sv2:
 services = st.session_state.services_selected
 
 # ---------------------------
-# ② 저장/불러오기/제출 (날짜 정의 이후 위치!)
-# ---------------------------
-st.markdown("#### 저장/제출")
-btn_cols = st.columns([1, 1, 1, 2])
-with btn_cols[0]:
-    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
-with btn_cols[1]:
-    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
-with btn_cols[2]:
-    submit_now = st.button("✅ 제출", disabled=not can_edit)  # 제출 후 미디어부가 확인
-
-# 제출 ID(제출 시 고정)
-if "submission_id" not in st.session_state:
-    st.session_state.submission_id = None
-
-if save_draft and can_edit:
-    try:
-        data = serialize_submission()
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        gh_put_bytes(
-            p["json"],
-            json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            message=f"[draft] {st.session_state.user_name} {worship_date} 저장"
-        )
-        st.success("임시 저장되었습니다. (GitHub)")
-    except Exception as e:
-        st.error(f"임시 저장 실패: {e}")
-
-if load_draft and can_edit:
-    try:
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        draft_bytes = gh_get_bytes(p["json"])
-        payload = json.loads(draft_bytes.decode("utf-8"))
-        load_into_session(payload)
-        st.success("임시 저장본을 불러왔습니다.")
-        st.rerun()
-    except Exception as e:
-        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
-
-if submit_now and can_edit:
-    try:
-        # 1) docx 생성
-        docx_bytes = build_docx(
-            worship_date=worship_date,
-            services=st.session_state.services_selected,
-            materials=st.session_state.materials,
-            user_name=st.session_state.user_name,
-            position=st.session_state.position,
-            role=st.session_state.role
-        )
-        # 2) JSON + DOCX 업로드 (제출용 고유 ID 생성)
-        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        st.session_state.submission_id = sub_id
-        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
-
-        data = serialize_submission()
-        data["status"] = "submitted"
-        data["submission_id"] = sub_id
-
-        gh_put_bytes(
-            p["json"],
-            json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            message=f"[submit] {st.session_state.user_name} {worship_date} 제출"
-        )
-        gh_put_bytes(
-            p["docx"],
-            docx_bytes,
-            message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX"
-        )
-
-        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
-    except Exception as e:
-        st.error(f"제출 실패: {e}")
-
-st.divider()
-
-# ---------------------------
 # ③ 자료 추가 (순서 조절 포함)
 # ---------------------------
 st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
@@ -630,6 +553,82 @@ if to_remove and can_edit:
 
 st.divider()
 
+# ---------------------------
+# ② 저장/불러오기/제출 (순서 변경)
+# ---------------------------
+st.markdown("#### 저장/제출")
+btn_cols = st.columns([1, 1, 1, 2])
+with btn_cols[0]:
+    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
+with btn_cols[1]:
+    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
+with btn_cols[2]:
+    submit_now = st.button("✅ 제출", disabled=not can_edit)  # 제출 후 미디어부가 확인
+
+# 제출 ID(제출 시 고정)
+if "submission_id" not in st.session_state:
+    st.session_state.submission_id = None
+
+if save_draft and can_edit:
+    try:
+        data = serialize_submission()
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[draft] {st.session_state.user_name} {worship_date} 저장"
+        )
+        st.success("임시 저장되었습니다. (GitHub)")
+    except Exception as e:
+        st.error(f"임시 저장 실패: {e}")
+
+if load_draft and can_edit:
+    try:
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        draft_bytes = gh_get_bytes(p["json"])
+        payload = json.loads(draft_bytes.decode("utf-8"))
+        load_into_session(payload)
+        st.success("임시 저장본을 불러왔습니다.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
+
+if submit_now and can_edit:
+    try:
+        # 1) docx 생성
+        docx_bytes = build_docx(
+            worship_date=worship_date,
+            services=st.session_state.services_selected,
+            materials=st.session_state.materials,
+            user_name=st.session_state.user_name,
+            position=st.session_state.position,
+            role=st.session_state.role
+        )
+        # 2) JSON + DOCX 업로드 (제출용 고유 ID 생성)
+        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        st.session_state.submission_id = sub_id
+        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
+
+        data = serialize_submission()
+        data["status"] = "submitted"
+        data["submission_id"] = sub_id
+
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[submit] {st.session_state.user_name} {worship_date} 제출"
+        )
+        gh_put_bytes(
+            p["docx"],
+            docx_bytes,
+            message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX"
+        )
+
+        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
+    except Exception as e:
+        st.error(f"제출 실패: {e}")
+
+st.divider()
 # ---------------------------
 # ④ 업로드(Word 저장)
 # ---------------------------
