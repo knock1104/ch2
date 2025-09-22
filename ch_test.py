@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit 예배 자료 업로드 + Word 저장 + GitHub 임시저장/제출 (완성본)
+Streamlit 예배 자료 업로드 + Word 저장 + GitHub 임시저장/제출 (정리/수정본)
 - 예배 구분 직접기입
 - 자료 순서 조절
 - 라이브 프리뷰 삭제
 - 이미지 여러 장 업로드
 - 설명 강조(**굵게**, ==형광펜==) -> Word 반영
 - 자료 유형 '설교 전문' 추가
-- GitHub에 파일 업로드 후 JSON에는 메타데이터만 저장 (UploadedFile 직렬화 문제 해결)
+- GitHub에 파일 업로드 후 JSON에는 메타데이터만 저장
 - 저장/불러오기/제출 섹션을 '맨 하단'으로 이동
 """
 
@@ -277,47 +277,45 @@ def upload_streamlit_file_to_github(uploaded_file, dest_dir: str, msg_prefix: st
     }
 
 def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir: str, msg_prefix: str) -> List[Dict[str, Any]]:
+    """
+    - 이미지/기타 파일을 GitHub에 업로드
+    - UploadedFile을 메타데이터(dict)로 치환하여 JSON 직렬화 가능하게 반환
+    - 이미 메타데이터(dict)인 경우는 그대로 둠
+    """
     out = []
     for m in materials:
         m2 = deepcopy(m)
         kind = m2.get("kind", "")
+
         if kind == "이미지":
             metas = []
             files = m2.get("files") or []
             for f in files:
                 if hasattr(f, "getvalue"):  # UploadedFile
                     metas.append(upload_streamlit_file_to_github(f, files_dir, msg_prefix))
-                elif isinstance(f, dict) and "path" in f:
+                elif isinstance(f, dict) and "path" in f:  # 이미 메타데이터
                     metas.append(f)
             m2["files"] = metas
             m2["file"] = None
-        elif item["kind"] == "기타 파일":
-    # 기존 값 보존 (메타 dict 또는 UploadedFile)
-    existing = item.get("file")
 
-    # 기존 파일 이름 보여주기
-    if existing:
-        if isinstance(existing, dict):
-            st.caption(f"기존 첨부: {existing.get('name','(이름 없음)')}")
-        elif hasattr(existing, "name"):
-            st.caption(f"기존 첨부: {existing.name}")
+        elif kind == "기타 파일":
+            f = m2.get("file")
+            if hasattr(f, "getvalue"):
+                m2["file"] = upload_streamlit_file_to_github(f, files_dir, msg_prefix)
+            elif isinstance(f, dict) and "path" in f:
+                pass  # 그대로 유지
+            else:
+                m2["file"] = None
 
-    # 새로 선택하면 교체, 아니면 기존 유지
-    new_one = st.file_uploader(
-        "기타 파일 업로드",
-        type=None,
-        key=f"file_{item['id']}",
-        accept_multiple_files=False,
-        disabled=not can_edit
-    )
+        else:
+            # 성경/설교전문 등
+            if "files" in m2 and not isinstance(m2["files"], list):
+                m2["files"] = []
+            if "file" in m2 and not isinstance(m2["file"], (dict, type(None))):
+                m2["file"] = None
 
-    if new_one is not None:
-        item["file"] = new_one    # 교체(저장은 나중에 save/submit에서 GitHub로 업로드)
-    else:
-        item["file"] = existing   # 유지
-
-    item["verse_text"] = ""
-    item["files"] = []
+        out.append(m2)
+    return out
 
 # ---------------------------
 # build_docx (메타/로컬 모두 처리)
@@ -375,40 +373,29 @@ def build_docx(
                 else:
                     doc.add_paragraph("(성경 구절 미입력)")
 
-            elif item["kind"] == "이미지":
-    # 1) 기존 값(메타데이터 dict 또는 UploadedFile 섞여 있을 수 있음) 보존
-    existing = item.get("files") or []
-
-    # 2) 기존 파일 목록 보여주기 (이름 기준)
-    if existing:
-        with st.expander("📷 기존 이미지 보기", expanded=False):
-            names = []
-            for f in existing:
-                if isinstance(f, dict):      # 메타데이터(불러오기 후)
-                    names.append(f.get("name") or os.path.basename(f.get("path","")))
-                elif hasattr(f, "name"):     # UploadedFile(방금 올린 것)
-                    names.append(f.name)
-            st.write(", ".join(names) if names else "(목록 없음)")
-
-    # 3) 새로 추가 업로드 (기존을 덮지 말고 '추가' 개념)
-    new_uploads = st.file_uploader(
-        "이미지 업로드 (PNG/JPG) — 여러 장 선택 가능",
-        type=["png", "jpg", "jpeg"],
-        key=f"files_{item['id']}",
-        accept_multiple_files=True,
-        disabled=not can_edit
-    )
-
-    # 4) 합쳐 넣기: 새 업로드가 있으면 기존 + 신규, 없으면 기존 유지
-    if new_uploads and len(new_uploads) > 0:
-        # 기존 리스트 + 새로 올린 UploadedFile 리스트
-        item["files"] = existing + new_uploads
-    else:
-        item["files"] = existing  # 유지
-
-    # 성경/기타 호환 키 정리
-    item["verse_text"] = ""
-    item["file"] = None  # 단일 파일 키는 사용 안 함
+            elif kind == "이미지":
+                if files:
+                    for f in files:
+                        try:
+                            if isinstance(f, dict) and "path" in f:
+                                img_bytes = gh_get_bytes(f["path"])
+                                _, ext = os.path.splitext(f.get("name") or f["path"])
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".img") as tmp:
+                                    tmp.write(img_bytes)
+                                    tmp.flush()
+                                    doc.add_picture(tmp.name, width=Inches(5))
+                            elif hasattr(f, "getvalue"):
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(getattr(f, "name", ""))[1]) as tmp:
+                                    tmp.write(f.getvalue())
+                                    tmp.flush()
+                                    doc.add_picture(tmp.name, width=Inches(5))
+                        except Exception:
+                            doc.add_paragraph(
+                                f"(이미지 삽입 실패) 파일: "
+                                f"{(f.get('name') if isinstance(f, dict) else getattr(f, 'name', 'unknown'))}"
+                            )
+                else:
+                    doc.add_paragraph("(이미지 파일 없음)")
 
             elif kind == "기타 파일":
                 if isinstance(single_file, dict) and "name" in single_file:
@@ -553,24 +540,56 @@ for i, item in enumerate(st.session_state.materials):
             item["files"], item["file"] = [], None
 
         elif item["kind"] == "이미지":
-            item["files"] = st.file_uploader(
+            # 기존 이미지(메타/업로드) 보존 + 신규 추가 병합
+            existing = item.get("files") or []
+            if existing:
+                with st.expander("📷 기존 이미지 보기", expanded=False):
+                    names = []
+                    for f in existing:
+                        if isinstance(f, dict):
+                            names.append(f.get("name") or os.path.basename(f.get("path", "")))
+                        elif hasattr(f, "name"):
+                            names.append(f.name)
+                    st.write(", ".join(names) if names else "(목록 없음)")
+
+            new_uploads = st.file_uploader(
                 "이미지 업로드 (PNG/JPG) — 여러 장 선택 가능",
                 type=["png", "jpg", "jpeg"],
                 key=f"files_{item['id']}",
                 accept_multiple_files=True,
                 disabled=not can_edit
             )
-            item["verse_text"], item["file"] = "", None
+            if new_uploads and len(new_uploads) > 0:
+                item["files"] = existing + new_uploads
+            else:
+                item["files"] = existing
+
+            item["verse_text"] = ""
+            item["file"] = None
 
         elif item["kind"] == "기타 파일":
-            item["file"] = st.file_uploader(
+            # 기존 첨부 유지 + 새로 업로드 시 교체
+            existing = item.get("file")
+            if existing:
+                if isinstance(existing, dict):
+                    st.caption(f"기존 첨부: {existing.get('name','(이름 없음)')}")
+                elif hasattr(existing, "name"):
+                    st.caption(f"기존 첨부: {existing.name}")
+
+            new_one = st.file_uploader(
                 "기타 파일 업로드",
                 type=None,
                 key=f"file_{item['id']}",
                 accept_multiple_files=False,
                 disabled=not can_edit
             )
-            item["verse_text"], item["files"] = "", []
+            if new_one is not None:
+                item["file"] = new_one
+            else:
+                item["file"] = existing
+
+            item["verse_text"] = ""
+            item["files"] = []
 
         elif item["kind"] == "설교 전문":
             item["full_text"] = st.text_area(
