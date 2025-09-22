@@ -1,72 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit 예배 자료 업로드 + Word 저장 (개편+저장/제출 버전)
-요청 반영:
-1) 예배 구분 직접기입
-2) 자료 순서 조절
-3) 라이브 프리뷰 삭제
-4) 이미지 여러 장 업로드
-5) 설명 강조(**굵게**, ==형광펜==) -> Word 반영
-6) 자료 유형 '텍스트' 추가
-7) 임시 저장/불러오기/제출(GitHub Contents API)
+Streamlit 예배 자료 업로드 + Word 저장 + GitHub 임시저장/제출 (완성본)
+- 예배 구분 직접기입
+- 자료 순서 조절
+- 라이브 프리뷰 삭제
+- 이미지 여러 장 업로드
+- 설명 강조(**굵게**, ==형광펜==) -> Word 반영
+- 자료 유형 '설교 전문' 추가
+- GitHub에 파일 업로드 후 JSON에는 메타데이터만 저장 (UploadedFile 직렬화 문제 해결)
+- 저장/불러오기/제출 섹션을 '맨 하단'으로 이동
 """
 
 # ---------------------------
-# 페이지 설정 (최상단)
+# 페이지 설정 (최상단 필수)
 # ---------------------------
 import streamlit as st
-st.set_page_config(
-    page_title="설교 자료 업로드",
-    page_icon="🙏",
-    layout="wide"
-)
+st.set_page_config(page_title="설교 자료 업로드", page_icon="🙏", layout="wide")
 
 # ---------------------------
-# 표준 라이브러리 / 서드파티
+# 표준/서드파티 import
 # ---------------------------
 import io
 import os
+import re
+import json
 import uuid
 import base64
 import tempfile
-import re
-import json
 import requests
-from datetime import date, datetime, timezone
-from typing import List, Dict, Any
-
 import hashlib
 import mimetypes
-
-def sanitize_filename(name: str) -> str:
-    name = os.path.basename(name or "upload.bin")
-    return name.replace("/", "_").replace("\\", "_").strip()
-
-def _sha1(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
-
-def upload_streamlit_file_to_github(uploaded_file, dest_dir: str, msg_prefix: str = "[file]") -> dict:
-    """
-    Streamlit UploadedFile -> GitHub에 저장 후 메타데이터 반환
-    반환 예: {"name": "...", "path": "...", "size": 1234, "content_type": "image/png", "sha1": "..."}
-    """
-    if uploaded_file is None:
-        return {}
-    data = uploaded_file.getvalue()
-    sha1 = _sha1(data)
-    orig_name = getattr(uploaded_file, "name", "upload.bin")
-    safe_name = sanitize_filename(orig_name)
-    # 중복 방지를 위해 해시 prefix 붙이기
-    dest_path = f"{dest_dir}/{sha1[:10]}_{safe_name}"
-    # 업로드
-    gh_put_bytes(dest_path, data, message=f"{msg_prefix} upload {safe_name}")
-    return {
-        "name": orig_name,
-        "path": dest_path,
-        "size": len(data),
-        "content_type": getattr(uploaded_file, "type", mimetypes.guess_type(orig_name)[0]),
-        "sha1": sha1,
-    }
+from copy import deepcopy
+from typing import List, Dict, Any
+from datetime import date, datetime, timezone
 
 # python-docx / PIL
 try:
@@ -91,10 +57,6 @@ st.markdown(
     <style>
     .small-note { color:#666; font-size:0.9rem; }
     .section-title { font-weight:700; font-size:1.1rem; margin-top:0.5rem; }
-    .pill {
-        display:inline-block; padding:4px 10px; border-radius:999px; background:#f0f2f6; margin-right:6px;
-        font-size:0.85rem; color:#333; border:1px solid #e5e7eb;
-    }
     .landing-card {
         padding: 16px; border: 1px solid #e5e7eb; border-radius: 12px; background: #fff;
         box-shadow: 0 4px 12px rgba(0,0,0,0.04);
@@ -108,13 +70,10 @@ st.markdown(
 # 세션 상태 초기화
 # ---------------------------
 if "materials" not in st.session_state:
-    # 각 항목: {id, kind, files, file, verse_text, description, full_text}
     st.session_state.materials: List[Dict[str, Any]] = []
-
 if "preview_idx" not in st.session_state:
-    st.session_state.preview_idx = 0  # (프리뷰 제거, 호환 유지)
+    st.session_state.preview_idx = 0
 
-# 권한/사용자 상태
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "role" not in st.session_state:
@@ -125,8 +84,11 @@ if "position" not in st.session_state:
     st.session_state.position = ""
 if "can_edit" not in st.session_state:
     st.session_state.can_edit = False
+if "worship_date" not in st.session_state:
+    st.session_state.worship_date = date.today()
+if "submission_id" not in st.session_state:
+    st.session_state.submission_id = None
 
-# 예배 구분(옵션/선택) 상태
 BASE_SERVICES = ["1부", "2부", "3부", "오후예배"]
 if "services_options" not in st.session_state:
     st.session_state.services_options = BASE_SERVICES.copy()
@@ -134,7 +96,7 @@ if "services_selected" not in st.session_state:
     st.session_state.services_selected: List[str] = []
 
 # ---------------------------
-# 0) 랜딩 페이지 (권한/접근 제어)
+# 랜딩 (권한/접근)
 # ---------------------------
 def render_landing():
     st.title("Ch2 설교 자료 업로더")
@@ -147,13 +109,12 @@ def render_landing():
         unsafe_allow_html=True
     )
     st.write("")
-
     with st.form("landing_form"):
         role = st.radio("역할 선택", ["교역자", "미디어부"], horizontal=True)
-        cols = st.columns(2)
-        with cols[0]:
+        c1, c2 = st.columns(2)
+        with c1:
             user_name = st.text_input("이름")
-        with cols[1]:
+        with c2:
             position = st.selectbox(
                 "직분 선택",
                 ['원로목사', "담임목사", "부목사", '강도사', "전도사", "미디어부"],
@@ -161,7 +122,6 @@ def render_landing():
             )
         access_code = st.text_input("개인 액세스 코드", type="password", placeholder="예) 0001")
         submitted = st.form_submit_button("입장")
-
     if submitted:
         if access_code == "0001":
             st.session_state.authenticated = True
@@ -190,24 +150,23 @@ st.markdown(
 )
 
 # ---------------------------
-# 유틸 함수 (자료 편집)
+# 자료 유틸
 # ---------------------------
 def add_material():
     st.session_state.materials.append({
         "id": str(uuid.uuid4()),
-        "kind": "성경 구절",     # "성경 구절" | "이미지" | "기타 파일" | "텍스트"
-        "files": [],             # 이미지 다중 업로드용
-        "file": None,            # 과거 호환(단일 파일)
+        "kind": "성경 구절",
+        "files": [],             # 이미지 다중
+        "file": None,            # 기타 파일 단일
         "verse_text": "",
         "description": "",
-        "full_text": ""          # 텍스트
+        "full_text": ""
     })
 
 def remove_material(mid: str):
     st.session_state.materials = [m for m in st.session_state.materials if m["id"] != mid]
 
 def move_material(mid: str, direction: str):
-    """direction: 'up' or 'down'"""
     mats = st.session_state.materials
     idx = next((i for i, m in enumerate(mats) if m["id"] == mid), None)
     if idx is None:
@@ -222,12 +181,6 @@ def move_material(mid: str, direction: str):
         st.rerun()
 
 def add_rich_text(paragraph, text: str):
-    """
-    간단 마크업 → Word 서식 변환:
-      **굵게**  => bold
-      ==형광펜== => highlight(YELLOW)
-    그 외는 일반 텍스트로 추가.
-    """
     if not text:
         return
     pattern = r'(\*\*.*?\*\*|==.*?==)'
@@ -247,123 +200,8 @@ def add_rich_text(paragraph, text: str):
         else:
             paragraph.add_run(part)
 
-def build_docx(
-    worship_date: date,
-    services: List[str],
-    materials: List[Dict[str, Any]],
-    user_name: str,
-    position: str,
-    role: str,
-) -> bytes:
-    """문서(.docx) 생성 후 바이트로 반환 (텍스트/강조 마크업 반영 버전)"""
-    if Document is None:
-        raise RuntimeError("python-docx가 설치되지 않았습니다. 'pip install python-docx' 실행 후 다시 시도해주세요.")
-
-    doc = Document()
-
-    # 글꼴 기본값(선택)
-    style = doc.styles['Normal']
-    style.font.name = '맑은 고딕'
-    style.font.size = Pt(11)
-
-    # 제목
-    title = doc.add_paragraph()
-    run = title.add_run("설교 자료")
-    run.bold = True
-    run.font.size = Pt(20)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # 메타 정보
-    meta = doc.add_paragraph()
-    meta.add_run(f"날짜: {worship_date.strftime('%Y-%m-%d')}\n").bold = True
-    if services:
-        meta.add_run("예배 구분: " + ", ".join(services) + "\n").bold = True
-    else:
-        meta.add_run("예배 구분: (미선택)\n").bold = True
-    if user_name or position or role:
-        meta.add_run(f"작성자/권한: {user_name or '(미입력)'} ({position or '직분 미선택'}) - {role or '권한 미지정'}").bold = True
-
-    doc.add_paragraph("")
-
-    # 자료(스토리보드)
-    doc.add_heading("자료 (스토리보드)", level=1)
-    if not materials:
-        doc.add_paragraph("(추가된 자료가 없습니다)")
-    else:
-        for idx, item in enumerate(materials, start=1):
-            kind = item.get("kind", "")
-            verse_text = item.get("verse_text", "") or ""
-            description = item.get("description", "") or ""
-            full_text = item.get("full_text", "") or ""
-            files = item.get("files", []) or []
-            single_file = item.get("file", None)  # 과거 호환
-
-            doc.add_heading(f"{idx}. {kind}", level=2)
-
-            if kind == "성경 구절":
-                if verse_text.strip():
-                    for line in verse_text.splitlines():
-                        p = doc.add_paragraph()
-                        add_rich_text(p, line)
-                    doc.add_paragraph("")
-                else:
-                    doc.add_paragraph("(성경 구절 미입력)")
-
-            elif kind == "이미지":
-                # 다중 업로드(현행)
-                if files and Image is not None:
-                    for f in files:
-                        try:
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1]) as tmp:
-                                tmp.write(f.getvalue())
-                                tmp.flush()
-                                doc.add_picture(tmp.name, width=Inches(5))
-                        except Exception:
-                            doc.add_paragraph(f"(이미지 삽입 실패) 파일명: {getattr(f, 'name', 'unknown')}")
-                # 단일 파일(과거 호환)
-                elif single_file is not None and Image is not None:
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(single_file.name)[1]) as tmp:
-                            tmp.write(single_file.getvalue())
-                            tmp.flush()
-                            doc.add_picture(tmp.name, width=Inches(5))
-                    except Exception:
-                        doc.add_paragraph(f"(이미지 삽입 실패) 파일명: {single_file.name}")
-                else:
-                    doc.add_paragraph("(이미지 파일 없음)")
-
-            elif kind == "기타 파일":
-                if single_file is not None:
-                    doc.add_paragraph(f"첨부 파일: {single_file.name} (문서에 직접 삽입되지 않습니다)")
-                else:
-                    doc.add_paragraph("(첨부 파일 없음)")
-
-            elif kind == "텍스트":
-                if full_text.strip():
-                    for line in full_text.splitlines():
-                        p = doc.add_paragraph()
-                        add_rich_text(p, line)
-                else:
-                    doc.add_paragraph("(텍스트 미입력)")
-
-            # 공통: 설명(스토리보드) — 마크업 반영
-            p = doc.add_paragraph()
-            p.add_run("설명(스토리보드): ")
-            if description.strip():
-                add_rich_text(p, description)
-            else:
-                p.add_run("(미입력)")
-
-            doc.add_paragraph("")
-
-    # 최종 저장
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer.read()
-
 # ---------------------------
-# GitHub 저장/불러오기 유틸
+# GitHub 유틸
 # ---------------------------
 def _gh_headers():
     return {
@@ -377,15 +215,10 @@ def _gh_api_base():
     return f"https://api.github.com/repos/{owner}/{repo}"
 
 def gh_put_bytes(path: str, content_bytes: bytes, message: str):
-    """
-    GitHub Contents API로 파일 생성/업데이트
-    """
     api = _gh_api_base()
     url = f"{api}/contents/{path}"
-    # 기존 sha 조회(업데이트 대비)
     get = requests.get(url, headers=_gh_headers())
     sha = get.json().get("sha") if get.status_code == 200 else None
-
     b64 = base64.b64encode(content_bytes).decode("utf-8")
     payload = {
         "message": message,
@@ -394,7 +227,6 @@ def gh_put_bytes(path: str, content_bytes: bytes, message: str):
     }
     if sha:
         payload["sha"] = sha
-
     r = requests.put(url, headers=_gh_headers(), json=payload)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"GitHub 업로드 실패: {r.status_code} {r.text}")
@@ -414,10 +246,178 @@ def gh_list_dir(path: str):
     url = f"{api}/contents/{path}"
     r = requests.get(url, headers=_gh_headers())
     if r.status_code != 200:
-        return []  # 폴더 없을 수 있음(초기)
-    return r.json()  # list of items (name, path, type, sha ...)
+        return []
+    return r.json()
 
-# 제출 데이터 직렬화/역직렬화
+# ---------------------------
+# 파일 업로드 보조(메타데이터화)
+# ---------------------------
+def sanitize_filename(name: str) -> str:
+    name = os.path.basename(name or "upload.bin")
+    return name.replace("/", "_").replace("\\", "_").strip()
+
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def upload_streamlit_file_to_github(uploaded_file, dest_dir: str, msg_prefix: str = "[file]") -> dict:
+    if uploaded_file is None:
+        return {}
+    data = uploaded_file.getvalue()
+    sha1 = _sha1(data)
+    orig_name = getattr(uploaded_file, "name", "upload.bin")
+    safe_name = sanitize_filename(orig_name)
+    dest_path = f"{dest_dir}/{sha1[:10]}_{safe_name}"
+    gh_put_bytes(dest_path, data, message=f"{msg_prefix} upload {safe_name}")
+    return {
+        "name": orig_name,
+        "path": dest_path,
+        "size": len(data),
+        "content_type": getattr(uploaded_file, "type", mimetypes.guess_type(orig_name)[0]),
+        "sha1": sha1,
+    }
+
+def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir: str, msg_prefix: str) -> List[Dict[str, Any]]:
+    out = []
+    for m in materials:
+        m2 = deepcopy(m)
+        kind = m2.get("kind", "")
+        if kind == "이미지":
+            metas = []
+            files = m2.get("files") or []
+            for f in files:
+                if hasattr(f, "getvalue"):  # UploadedFile
+                    metas.append(upload_streamlit_file_to_github(f, files_dir, msg_prefix))
+                elif isinstance(f, dict) and "path" in f:
+                    metas.append(f)
+            m2["files"] = metas
+            m2["file"] = None
+        elif kind == "기타 파일":
+            f = m2.get("file")
+            if hasattr(f, "getvalue"):
+                m2["file"] = upload_streamlit_file_to_github(f, files_dir, msg_prefix)
+            elif isinstance(f, dict) and "path" in f:
+                pass
+            else:
+                m2["file"] = None
+        else:
+            m2["files"] = [] if not isinstance(m2.get("files"), list) else m2["files"]
+            m2["file"] = m2.get("file") if isinstance(m2.get("file"), (dict, type(None))) else None
+        out.append(m2)
+    return out
+
+# ---------------------------
+# build_docx (메타/로컬 모두 처리)
+# ---------------------------
+def build_docx(
+    worship_date: date,
+    services: List[str],
+    materials: List[Dict[str, Any]],
+    user_name: str,
+    position: str,
+    role: str,
+) -> bytes:
+    if Document is None:
+        raise RuntimeError("python-docx가 설치되지 않았습니다. 'pip install python-docx' 실행 후 다시 시도해주세요.")
+    doc = Document()
+
+    style = doc.styles['Normal']
+    style.font.name = '맑은 고딕'
+    style.font.size = Pt(11)
+
+    title = doc.add_paragraph()
+    run = title.add_run("설교 자료")
+    run.bold = True
+    run.font.size = Pt(20)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.add_run(f"날짜: {worship_date.strftime('%Y-%m-%d')}\n").bold = True
+    meta.add_run("예배 구분: " + (", ".join(services) if services else "(미선택)") + "\n").bold = True
+    if user_name or position or role:
+        meta.add_run(f"작성자/권한: {user_name or '(미입력)'} ({position or '직분 미선택'}) - {role or '권한 미지정'}").bold = True
+
+    doc.add_paragraph("")
+    doc.add_heading("자료 (스토리보드)", level=1)
+
+    if not materials:
+        doc.add_paragraph("(추가된 자료가 없습니다)")
+    else:
+        for idx, item in enumerate(materials, start=1):
+            kind = item.get("kind", "")
+            verse_text = item.get("verse_text", "") or ""
+            description = item.get("description", "") or ""
+            full_text = item.get("full_text", "") or ""
+            files = item.get("files", []) or []
+            single_file = item.get("file")
+
+            doc.add_heading(f"{idx}. {kind}", level=2)
+
+            if kind == "성경 구절":
+                if verse_text.strip():
+                    for line in verse_text.splitlines():
+                        p = doc.add_paragraph()
+                        add_rich_text(p, line)
+                    doc.add_paragraph("")
+                else:
+                    doc.add_paragraph("(성경 구절 미입력)")
+
+            elif kind == "이미지":
+                if files:
+                    for f in files:
+                        try:
+                            if isinstance(f, dict) and "path" in f:  # 메타에서 GitHub 다운로드
+                                img_bytes = gh_get_bytes(f["path"])
+                                _, ext = os.path.splitext(f.get("name") or f["path"])
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".img") as tmp:
+                                    tmp.write(img_bytes)
+                                    tmp.flush()
+                                    doc.add_picture(tmp.name, width=Inches(5))
+                            elif hasattr(f, "getvalue"):  # 세션의 UploadedFile 직접 삽입
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(getattr(f, "name", ""))[1]) as tmp:
+                                    tmp.write(f.getvalue())
+                                    tmp.flush()
+                                    doc.add_picture(tmp.name, width=Inches(5))
+                        except Exception:
+                            doc.add_paragraph(
+                                f"(이미지 삽입 실패) 파일: "
+                                f"{(f.get('name') if isinstance(f, dict) else getattr(f, 'name', 'unknown'))}"
+                            )
+                else:
+                    doc.add_paragraph("(이미지 파일 없음)")
+
+            elif kind == "기타 파일":
+                if isinstance(single_file, dict) and "name" in single_file:
+                    doc.add_paragraph(f"첨부 파일: {single_file['name']} (문서에 직접 삽입되지 않습니다)")
+                elif single_file is not None and hasattr(single_file, "getvalue"):
+                    doc.add_paragraph(f"첨부 파일: {getattr(single_file, 'name', '파일')} (문서에 직접 삽입되지 않습니다)")
+                else:
+                    doc.add_paragraph("(첨부 파일 없음)")
+
+            elif kind == "설교 전문":
+                if full_text.strip():
+                    for line in full_text.splitlines():
+                        p = doc.add_paragraph()
+                        add_rich_text(p, line)
+                else:
+                    doc.add_paragraph("(설교 전문 미입력)")
+
+            p = doc.add_paragraph()
+            p.add_run("설명(스토리보드): ")
+            if description.strip():
+                add_rich_text(p, description)
+            else:
+                p.add_run("(미입력)")
+
+            doc.add_paragraph("")
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.read()
+
+# ---------------------------
+# 제출 직렬화/역직렬화 + 경로
+# ---------------------------
 def serialize_submission():
     return {
         "worship_date": str(st.session_state.get("worship_date")),
@@ -433,9 +433,7 @@ def load_into_session(payload: dict):
     st.session_state.worship_date = date.fromisoformat(payload.get("worship_date"))
     st.session_state.services_selected = payload.get("services", [])
     st.session_state.materials = payload.get("materials", [])
-    # 작성자/권한은 현재 세션값 유지
 
-# 경로 규칙 (draft / submitted)
 def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
     base = st.secrets.get("GITHUB_BASE_DIR", "worship_submissions")
     d = worship_date.strftime("%Y-%m-%d")
@@ -443,8 +441,10 @@ def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
     sub_id = "draft" if submission_id is None else submission_id
     folder = f"{base}/{d}/{safe_user}/{sub_id}"
     return {
+        "folder": folder,
+        "files_dir": f"{folder}/files",
         "json": f"{folder}/submission.json",
-        "docx": f"{folder}/submission.docx"
+        "docx": f"{folder}/submission.docx",
     }
 
 # ---------------------------
@@ -452,23 +452,16 @@ def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
 # ---------------------------
 st.markdown("<div class='section-title'>① 날짜/예배 선택</div>", unsafe_allow_html=True)
 
-# 세션의 worship_date 초기화(안전 가드)
-if "worship_date" not in st.session_state:
-    st.session_state.worship_date = date.today()
-
 worship_date = st.date_input(
     "예배 날짜",
     value=st.session_state.worship_date,
     format="YYYY-MM-DD",
     disabled=not can_edit
 )
-
-# 최신 선택값을 세션에 반영 (← 여기 순서가 매우 중요!)
 st.session_state.worship_date = worship_date
 
-# 예배 구분: 기본 옵션 + 직접 입력 추가
-col_sv1, col_sv2 = st.columns([2, 1])
-with col_sv1:
+c1, c2 = st.columns([2, 1])
+with c1:
     st.session_state.services_selected = st.multiselect(
         "예배 구분 선택",
         options=st.session_state.services_options,
@@ -476,7 +469,7 @@ with col_sv1:
         help="해당 날짜에 해당되는 예배를 모두 선택하세요.",
         disabled=not can_edit
     )
-with col_sv2:
+with c2:
     new_service = st.text_input("직접 입력", placeholder="예: 청년예배 / 새벽기도", disabled=not can_edit)
     add_new = st.button("추가", disabled=not can_edit)
     if add_new and new_service.strip():
@@ -487,11 +480,12 @@ with col_sv2:
         st.rerun()
 
 services = st.session_state.services_selected
+st.divider()
 
 # ---------------------------
-# ③ 자료 추가 (순서 조절 포함)
+# ② 자료 추가 (순서 조절 포함)
 # ---------------------------
-st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/텍스트)</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
 st.caption("• 설명(스토리보드)에서 **굵게**, ==형광펜== 으로 강조하면 Word에 그대로 반영됩니다.")
 
 add_btn = st.button("+ 자료 추가", disabled=not can_edit)
@@ -501,28 +495,28 @@ if add_btn and can_edit:
 to_remove: List[str] = []
 for i, item in enumerate(st.session_state.materials):
     with st.container(border=True):
-        # 상단: 유형 선택 + 순서/삭제
         top_cols = st.columns([1.2, 0.2, 0.2, 0.2])
         with top_cols[0]:
             item["kind"] = st.selectbox(
                 "자료 유형",
-                ["성경 구절", "이미지", "기타 파일", "텍스트"],
-                index=["성경 구절", "이미지", "기타 파일", "텍스트"].index(item.get("kind", "성경 구절")),
+                ["성경 구절", "이미지", "기타 파일", "설교 전문"],
+                index=["성경 구절", "이미지", "기타 파일", "설교 전문"].index(item.get("kind", "성경 구절")),
                 key=f"kind_{item['id']}",
                 disabled=not can_edit
             )
         with top_cols[1]:
             st.write("")
-            st.button("▲", key=f"up_{item['id']}", disabled=(not can_edit or i == 0), on_click=move_material, args=(item["id"], "up"))
+            st.button("▲", key=f"up_{item['id']}", disabled=(not can_edit or i == 0),
+                      on_click=move_material, args=(item["id"], "up"))
         with top_cols[2]:
             st.write("")
-            st.button("▼", key=f"down_{item['id']}", disabled=(not can_edit or i == len(st.session_state.materials)-1), on_click=move_material, args=(item["id"], "down"))
+            st.button("▼", key=f"down_{item['id']}", disabled=(not can_edit or i == len(st.session_state.materials)-1),
+                      on_click=move_material, args=(item["id"], "down"))
         with top_cols[3]:
             st.write("")
             if st.button("삭제", key=f"del_{item['id']}", disabled=not can_edit):
                 to_remove.append(item["id"])
 
-        # 본문 입력 영역
         if item["kind"] == "성경 구절":
             item["verse_text"] = st.text_area(
                 "성경 구절 입력 (예: 요한복음 3:16)",
@@ -531,11 +525,9 @@ for i, item in enumerate(st.session_state.materials):
                 height=120,
                 disabled=not can_edit
             )
-            item["files"] = []
-            item["file"] = None
+            item["files"], item["file"] = [], None
 
         elif item["kind"] == "이미지":
-            # 다중 업로드
             item["files"] = st.file_uploader(
                 "이미지 업로드 (PNG/JPG) — 여러 장 선택 가능",
                 type=["png", "jpg", "jpeg"],
@@ -543,8 +535,7 @@ for i, item in enumerate(st.session_state.materials):
                 accept_multiple_files=True,
                 disabled=not can_edit
             )
-            item["verse_text"] = ""
-            item["file"] = None  # 단일 파일은 사용 안 함(과거 호환만)
+            item["verse_text"], item["file"] = "", None
 
         elif item["kind"] == "기타 파일":
             item["file"] = st.file_uploader(
@@ -554,22 +545,18 @@ for i, item in enumerate(st.session_state.materials):
                 accept_multiple_files=False,
                 disabled=not can_edit
             )
-            item["verse_text"] = ""
-            item["files"] = []
+            item["verse_text"], item["files"] = "", []
 
-        elif item["kind"] == "텍스트":
+        elif item["kind"] == "설교 전문":
             item["full_text"] = st.text_area(
-                "텍스트 입력 (줄바꿈 유지 / **굵게**, ==형광펜== 지원)",
+                "설교 전문 입력 (줄바꿈 유지 / **굵게**, ==형광펜== 지원)",
                 value=item.get("full_text", ""),
                 key=f"full_{item['id']}",
                 height=300,
                 disabled=not can_edit
             )
-            item["verse_text"] = ""
-            item["files"] = []
-            item["file"] = None
+            item["verse_text"], item["files"], item["file"] = "", [], None
 
-        # 설명(스토리보드): 마크업 안내
         item["description"] = st.text_area(
             "설명(스토리보드)",
             value=item.get("description", ""),
@@ -579,7 +566,6 @@ for i, item in enumerate(st.session_state.materials):
             disabled=not can_edit
         )
 
-# 실제 삭제 처리
 if to_remove and can_edit:
     for rid in to_remove:
         remove_material(rid)
@@ -587,84 +573,9 @@ if to_remove and can_edit:
 st.divider()
 
 # ---------------------------
-# ② 저장/불러오기/제출 (순서 변경)
+# ③ Word 파일 생성(로컬 다운로드)
 # ---------------------------
-st.markdown("#### 저장/제출")
-btn_cols = st.columns([1, 1, 1, 2])
-with btn_cols[0]:
-    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
-with btn_cols[1]:
-    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
-with btn_cols[2]:
-    submit_now = st.button("✅ 제출", disabled=not can_edit)  # 제출 후 미디어부가 확인
-
-# 제출 ID(제출 시 고정)
-if "submission_id" not in st.session_state:
-    st.session_state.submission_id = None
-
-if save_draft and can_edit:
-    try:
-        data = serialize_submission()
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        gh_put_bytes(
-            p["json"],
-            json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            message=f"[draft] {st.session_state.user_name} {worship_date} 저장"
-        )
-        st.success("임시 저장되었습니다. (GitHub)")
-    except Exception as e:
-        st.error(f"임시 저장 실패: {e}")
-
-if load_draft and can_edit:
-    try:
-        p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        draft_bytes = gh_get_bytes(p["json"])
-        payload = json.loads(draft_bytes.decode("utf-8"))
-        load_into_session(payload)
-        st.success("임시 저장본을 불러왔습니다.")
-        st.rerun()
-    except Exception as e:
-        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
-
-if submit_now and can_edit:
-    try:
-        # 1) docx 생성
-        docx_bytes = build_docx(
-            worship_date=worship_date,
-            services=st.session_state.services_selected,
-            materials=st.session_state.materials,
-            user_name=st.session_state.user_name,
-            position=st.session_state.position,
-            role=st.session_state.role
-        )
-        # 2) JSON + DOCX 업로드 (제출용 고유 ID 생성)
-        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        st.session_state.submission_id = sub_id
-        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
-
-        data = serialize_submission()
-        data["status"] = "submitted"
-        data["submission_id"] = sub_id
-
-        gh_put_bytes(
-            p["json"],
-            json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            message=f"[submit] {st.session_state.user_name} {worship_date} 제출"
-        )
-        gh_put_bytes(
-            p["docx"],
-            docx_bytes,
-            message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX"
-        )
-
-        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
-    except Exception as e:
-        st.error(f"제출 실패: {e}")
-
-st.divider()
-# ---------------------------
-# ④ 업로드(Word 저장)
-# ---------------------------
+st.markdown("<div class='section-title'>③ Word 저장 (로컬 미리 받기)</div>", unsafe_allow_html=True)
 col1, col2 = st.columns([1, 2])
 with col1:
     do_save = st.button("📄 업로드 하기 (Word 저장)", type="primary", disabled=not can_edit)
@@ -690,19 +601,103 @@ if do_save and can_edit:
     except Exception as e:
         st.error(f"문서 생성 중 오류가 발생했습니다: {e}")
 
+st.divider()
+
 # ---------------------------
-# ⑤ 미디어부 전용 제출함 (유틸/날짜 정의 이후여야 함)
+# ④ 저장/불러오기/제출 (맨 하단)
+# ---------------------------
+st.markdown("#### 저장/제출")
+b1, b2, b3, _ = st.columns([1,1,1,3])
+with b1:
+    save_draft = st.button("💾 임시 저장", disabled=not can_edit)
+with b2:
+    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
+with b3:
+    submit_now = st.button("✅ 제출", disabled=not can_edit)
+
+if save_draft and can_edit:
+    try:
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        # 파일 업로드 + materials 메타 치환
+        materials_detached = materials_upload_and_detach_files(
+            st.session_state.materials, p["files_dir"], msg_prefix="[draft-files]"
+        )
+        data = serialize_submission()
+        data["materials"] = materials_detached
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[draft] {st.session_state.user_name} {worship_date} 저장"
+        )
+        st.success("임시 저장되었습니다. (GitHub)")
+    except Exception as e:
+        st.error(f"임시 저장 실패: {e}")
+
+if load_draft and can_edit:
+    try:
+        p = gh_paths(st.session_state.user_name, worship_date)  # draft
+        draft_bytes = gh_get_bytes(p["json"])
+        payload = json.loads(draft_bytes.decode("utf-8"))
+        load_into_session(payload)
+        st.success("임시 저장본을 불러왔습니다.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"불러오기 실패 또는 저장본 없음: {e}")
+
+if submit_now and can_edit:
+    try:
+        sub_id = st.session_state.submission_id or datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        st.session_state.submission_id = sub_id
+        p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
+
+        # 1) 파일 업로드 + materials 메타 치환
+        materials_detached = materials_upload_and_detach_files(
+            st.session_state.materials, p["files_dir"], msg_prefix="[submit-files]"
+        )
+
+        # 2) DOCX 생성 (세션 데이터 기준)
+        docx_bytes = build_docx(
+            worship_date=worship_date,
+            services=st.session_state.services_selected,
+            materials=st.session_state.materials,  # 에디터에 보이는 현재 상태
+            user_name=st.session_state.user_name,
+            position=st.session_state.position,
+            role=st.session_state.role
+        )
+
+        # 3) JSON 업로드 (메타데이터 포함)
+        data = serialize_submission()
+        data["status"] = "submitted"
+        data["submission_id"] = sub_id
+        data["materials"] = materials_detached
+
+        gh_put_bytes(
+            p["json"],
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            message=f"[submit] {st.session_state.user_name} {worship_date} 제출"
+        )
+        gh_put_bytes(
+            p["docx"],
+            docx_bytes,
+            message=f"[submit-docx] {st.session_state.user_name} {worship_date} DOCX"
+        )
+        st.success("제출 완료! 미디어부 화면에서 확인 가능합니다.")
+    except Exception as e:
+        st.error(f"제출 실패: {e}")
+
+st.divider()
+
+# ---------------------------
+# ⑤ 미디어부 제출함 (검토/다운로드)
 # ---------------------------
 if st.session_state.role == "미디어부":
-    st.divider()
     st.markdown("### 📬 제출함(미디어부) — 날짜별/제출자별 목록")
-
     base = st.secrets.get("GITHUB_BASE_DIR", "worship_submissions")
     days = gh_list_dir(base)
     if not days:
         st.info("아직 제출된 자료가 없습니다.")
     else:
-        day_names = sorted([d["name"] for d in days if d["type"] == "dir"], reverse=True)
+        day_names = sorted([d["name"] for d in days if d.get("type") == "dir"], reverse=True)
         sel_day = st.selectbox("날짜 선택", options=day_names)
         if sel_day:
             day_dir = f"{base}/{sel_day}"
@@ -711,7 +706,7 @@ if st.session_state.role == "미디어부":
                 if u.get("type") != "dir":
                     continue
                 with st.expander(f"👤 {u['name']} — {sel_day} 제출물들"):
-                    subs = gh_list_dir(u["path"]) or []  # submission_id 디렉토리들
+                    subs = gh_list_dir(u["path"]) or []
                     for s in subs:
                         if s.get("type") != "dir":
                             continue
@@ -719,10 +714,10 @@ if st.session_state.role == "미디어부":
                         json_item = next((f for f in files if f.get("name") == "submission.json"), None)
                         docx_item = next((f for f in files if f.get("name") == "submission.docx"), None)
 
-                        cols = st.columns([2, 1, 2])
-                        with cols[0]:
+                        c1, c2, c3 = st.columns([2, 1, 2])
+                        with c1:
                             st.markdown(f"**제출 ID:** {s['name']}")
-                        with cols[1]:
+                        with c2:
                             if json_item:
                                 try:
                                     payload = json.loads(gh_get_bytes(json_item["path"]).decode("utf-8"))
@@ -736,8 +731,7 @@ if st.session_state.role == "미디어부":
                                     st.caption("메타 로드 실패")
                             else:
                                 st.caption("메타 없음")
-
-                        with cols[2]:
+                        with c3:
                             if docx_item:
                                 try:
                                     docx_bytes = gh_get_bytes(docx_item["path"])
@@ -751,7 +745,6 @@ if st.session_state.role == "미디어부":
                                 except Exception as e:
                                     st.error(f"다운로드 오류: {e}")
                             else:
-                                # JSON만 있고 DOCX 없는 제출물도 고려 → 즉석 변환
                                 if json_item and Document is not None:
                                     if st.button("📄 즉석 Word 생성", key=f"mk_{sel_day}_{u['name']}_{s['name']}"):
                                         try:
