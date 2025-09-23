@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit 예배 자료 업로드 + Word 저장 + GitHub 임시저장/제출 (정리/수정본)
-- 예배 구분 직접기입
-- 자료 순서 조절
-- 라이브 프리뷰 삭제
-- 이미지 여러 장 업로드
-- 설명 강조(**굵게**, ==형광펜==) -> Word 반영
-- 자료 유형 '설교 전문' 추가
-- GitHub에 파일 업로드 후 JSON에는 메타데이터만 저장
-- 저장/불러오기/제출 섹션을 '맨 하단'으로 이동
+Streamlit 예배 자료 업로드 + Word 저장 + GitHub 임시저장/제출 (+ 성경 JSON 연동)
+- '성경 구절' 자료 유형 선택 시: 책/장/절 선택 후 본문 자동 입력
+- 성경 JSON은 GitHub 리포의 bsk_json/{book_code}_{chap:03d}.json 에서 로드
 """
 
 # ---------------------------
-# 페이지 설정 (최상단 필수)
+# 페이지 설정
 # ---------------------------
 import streamlit as st
 st.set_page_config(page_title="설교 자료 업로드", page_icon="🙏", layout="wide")
@@ -20,19 +14,11 @@ st.set_page_config(page_title="설교 자료 업로드", page_icon="🙏", layou
 # ---------------------------
 # 표준/서드파티 import
 # ---------------------------
-import io
-import os
-import re
-import json
-import uuid
-import base64
-import tempfile
-import requests
-import hashlib
-import mimetypes
+import io, os, re, json, uuid, base64, tempfile, requests, hashlib, mimetypes, time
 from copy import deepcopy
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import date, datetime, timezone
+from functools import lru_cache
 
 # python-docx / PIL
 try:
@@ -73,11 +59,10 @@ if "materials" not in st.session_state:
     st.session_state.materials: List[Dict[str, Any]] = []
 if "preview_idx" not in st.session_state:
     st.session_state.preview_idx = 0
-
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "role" not in st.session_state:
-    st.session_state.role = None       # "교역자" | "미디어부"
+    st.session_state.role = None
 if "user_name" not in st.session_state:
     st.session_state.user_name = ""
 if "position" not in st.session_state:
@@ -94,6 +79,39 @@ if "services_options" not in st.session_state:
     st.session_state.services_options = BASE_SERVICES.copy()
 if "services_selected" not in st.session_state:
     st.session_state.services_selected: List[str] = []
+
+# ---------------------------
+# 성경 JSON 설정 (GitHub 경로/코드/장수)
+# ---------------------------
+BIBLE_JSON_DIR = st.secrets.get("GITHUB_BIBLE_DIR", "bsk_json")
+
+BOOKS = {
+    # OT
+    "창세기":"gen","출애굽기":"exo","레위기":"lev","민수기":"num","신명기":"deu",
+    "여호수아":"jos","사사기":"jdg","룻기":"rut","사무엘상":"1sa","사무엘하":"2sa",
+    "열왕기상":"1ki","열왕기하":"2ki","역대상":"1ch","역대하":"2ch","에스라":"ezr",
+    "느헤미야":"neh","에스더":"est","욥기":"job","시편":"psa","잠언":"pro",
+    "전도서":"ecc","아가":"sng","이사야":"isa","예레미야":"jer","예레미야애가":"lam",
+    "에스겔":"ezk","다니엘":"dan","호세아":"hos","요엘":"jol","아모스":"amo",
+    "오바댜":"oba","요나":"jnh","미가":"mic","나훔":"nam","하박국":"hab",
+    "스바냐":"zep","학개":"hag","스가랴":"zec","말라기":"mal",
+    # NT
+    "마태복음":"mat","마가복음":"mrk","누가복음":"luk","요한복음":"jhn","사도행전":"act",
+    "로마서":"rom","고린도전서":"1co","고린도후서":"2co","갈라디아서":"gal","에베소서":"eph",
+    "빌립보서":"php","골로새서":"col","데살로니가전서":"1th","데살로니가후서":"2th","디모데전서":"1ti",
+    "디모데후서":"2ti","디도서":"tit","빌레몬서":"phm","히브리서":"heb","야고보서":"jas",
+    "베드로전서":"1pe","베드로후서":"2pe","요한1서":"1jn","요한2서":"2jn","요한3서":"3jn",
+    "유다서":"jud","요한계시록":"rev"
+}
+CHAPTER_COUNT = {
+    "창세기":50,"출애굽기":40,"레위기":27,"민수기":36,"신명기":34,"여호수아":24,"사사기":21,"룻기":4,"사무엘상":31,"사무엘하":24,
+    "열왕기상":22,"열왕기하":25,"역대상":29,"역대하":36,"에스라":10,"느헤미야":13,"에스더":10,"욥기":42,"시편":150,"잠언":31,
+    "전도서":12,"아가":8,"이사야":66,"예레미야":52,"예레미야애가":5,"에스겔":48,"다니엘":12,"호세아":14,"요엘":3,"아모스":9,
+    "오바댜":1,"요나":4,"미가":7,"나훔":3,"하박국":3,"스바냐":3,"학개":2,"스가랴":14,"말라기":4,
+    "마태복음":28,"마가복음":16,"누가복음":24,"요한복음":21,"사도행전":28,"로마서":16,"고린도전서":16,"고린도후서":13,"갈라디아서":6,"에베소서":6,
+    "빌립보서":4,"골로새서":4,"데살로니가전서":5,"데살로니가후서":3,"디모데전서":6,"디모데후서":4,"디도서":3,"빌레몬서":1,"히브리서":13,"야고보서":5,
+    "베드로전서":5,"베드로후서":3,"요한1서":5,"요한2서":1,"요한3서":1,"유다서":1,"요한계시록":22
+}
 
 # ---------------------------
 # 랜딩 (권한/접근)
@@ -150,57 +168,6 @@ st.markdown(
 )
 
 # ---------------------------
-# 자료 유틸
-# ---------------------------
-def add_material():
-    st.session_state.materials.append({
-        "id": str(uuid.uuid4()),
-        "kind": "성경 구절",
-        "files": [],             # 이미지 다중
-        "file": None,            # 기타 파일 단일
-        "verse_text": "",
-        "description": "",
-        "full_text": ""
-    })
-
-def remove_material(mid: str):
-    st.session_state.materials = [m for m in st.session_state.materials if m["id"] != mid]
-
-def move_material(mid: str, direction: str):
-    mats = st.session_state.materials
-    idx = next((i for i, m in enumerate(mats) if m["id"] == mid), None)
-    if idx is None:
-        return
-    if direction == "up" and idx > 0:
-        mats[idx-1], mats[idx] = mats[idx], mats[idx-1]
-        st.session_state.materials = mats
-        st.rerun()
-    elif direction == "down" and idx < len(mats)-1:
-        mats[idx+1], mats[idx] = mats[idx], mats[idx+1]
-        st.session_state.materials = mats
-        st.rerun()
-
-def add_rich_text(paragraph, text: str):
-    if not text:
-        return
-    pattern = r'(\*\*.*?\*\*|==.*?==)'
-    parts = re.split(pattern, text)
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("**") and part.endswith("**"):
-            run = paragraph.add_run(part[2:-2])
-            run.bold = True
-        elif part.startswith("==") and part.endswith("=="):
-            run = paragraph.add_run(part[2:-2])
-            try:
-                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-            except Exception:
-                pass
-        else:
-            paragraph.add_run(part)
-
-# ---------------------------
 # GitHub 유틸
 # ---------------------------
 def _gh_headers():
@@ -250,6 +217,130 @@ def gh_list_dir(path: str):
     return r.json()
 
 # ---------------------------
+# 자료 유틸
+# ---------------------------
+def add_material():
+    st.session_state.materials.append({
+        "id": str(uuid.uuid4()),
+        "kind": "성경 구절",
+        "files": [],
+        "file": None,
+        "verse_text": "",
+        "description": "",
+        "full_text": ""
+    })
+
+def remove_material(mid: str):
+    st.session_state.materials = [m for m in st.session_state.materials if m["id"] != mid]
+
+def move_material(mid: str, direction: str):
+    mats = st.session_state.materials
+    idx = next((i for i, m in enumerate(mats) if m["id"] == mid), None)
+    if idx is None:
+        return
+    if direction == "up" and idx > 0:
+        mats[idx-1], mats[idx] = mats[idx], mats[idx-1]
+        st.session_state.materials = mats
+        st.rerun()
+    elif direction == "down" and idx < len(mats)-1:
+        mats[idx+1], mats[idx] = mats[idx], mats[idx+1]
+        st.session_state.materials = mats
+        st.rerun()
+
+def add_rich_text(paragraph, text: str):
+    if not text:
+        return
+    pattern = r'(\*\*.*?\*\*|==.*?==)'
+    parts = re.split(pattern, text)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        elif part.startswith("==") and part.endswith("=="):
+            run = paragraph.add_run(part[2:-2])
+            try:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            except Exception:
+                pass
+        else:
+            paragraph.add_run(part)
+
+# ---------------------------
+# 성경 JSON 로더 + 피커 위젯
+# ---------------------------
+@st.cache_data(show_spinner=False, ttl=60*30)
+def load_chapter_json_from_github(book_code: str, chap: int) -> Dict[str, Any]:
+    json_path = f"{BIBLE_JSON_DIR}/{book_code}_{chap:03d}.json"
+    return json.loads(gh_get_bytes(json_path).decode("utf-8"))
+
+def get_book_code(book_name: str) -> str:
+    code = BOOKS.get(book_name)
+    if not code:
+        raise ValueError(f"알 수 없는 책 이름: {book_name}")
+    return code
+
+def render_bible_picker(item: Dict[str, Any], disabled: bool):
+    st.markdown("**📖 성경 선택**")
+    c1, c2, c3 = st.columns([1.4, 0.8, 1.2])
+    with c1:
+        book_name = st.selectbox(
+            "책",
+            options=list(BOOKS.keys()),
+            key=f"bible_book_{item['id']}",
+            disabled=disabled,
+        )
+    book_code = get_book_code(book_name)
+    max_chap = CHAPTER_COUNT[book_name]
+
+    with c2:
+        chap = st.number_input("장", min_value=1, max_value=max_chap, step=1,
+                               key=f"bible_chap_{item['id']}", disabled=disabled)
+
+    # 절 범위 계산을 위해 해당 장 로드
+    data = None
+    try:
+        data = load_chapter_json_from_github(book_code, int(chap))
+        max_verse = len(data.get("verses", [])) or 1
+    except Exception as e:
+        st.error(f"성경 본문 로드 실패: {e}")
+        max_verse = 1
+
+    with c3:
+        vcols = st.columns(2)
+        with vcols[0]:
+            v_from = st.number_input("절(시작)", min_value=1, max_value=max_verse, value=1,
+                                     key=f"bible_v_from_{item['id']}", disabled=disabled)
+        with vcols[1]:
+            v_to = st.number_input("절(끝)", min_value=v_from, max_value=max_verse, value=v_from,
+                                   key=f"bible_v_to_{item['id']}", disabled=disabled)
+
+    preview = ""
+    if data:
+        verses = data.get("verses", [])
+        lines = []
+        for v in verses:
+            vn = v.get("verse")
+            if vn is not None and v_from <= vn <= v_to:
+                lines.append(f"{book_name} {int(chap)}:{vn} {v.get('text','').strip()}")
+        preview = "\n".join(lines)
+
+    st.text_area("미리보기", value=preview, height=140, disabled=True)
+
+    c4, c5 = st.columns([1, 1])
+    with c4:
+        if st.button("본문 삽입 (뒤에 추가)", key=f"bible_insert_append_{item['id']}", disabled=disabled):
+            prev = item.get("verse_text", "") or ""
+            new_block = preview.strip()
+            item["verse_text"] = (prev + ("\n" if prev and new_block else "") + new_block).strip()
+            st.success("본문을 추가했습니다.")
+    with c5:
+        if st.button("본문 대체 (전체 교체)", key=f"bible_insert_replace_{item['id']}", disabled=disabled):
+            item["verse_text"] = preview.strip()
+            st.success("본문을 교체했습니다.")
+
+# ---------------------------
 # 파일 업로드 보조(메타데이터화)
 # ---------------------------
 def sanitize_filename(name: str) -> str:
@@ -277,11 +368,6 @@ def upload_streamlit_file_to_github(uploaded_file, dest_dir: str, msg_prefix: st
     }
 
 def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir: str, msg_prefix: str) -> List[Dict[str, Any]]:
-    """
-    - 이미지/기타 파일을 GitHub에 업로드
-    - UploadedFile을 메타데이터(dict)로 치환하여 JSON 직렬화 가능하게 반환
-    - 이미 메타데이터(dict)인 경우는 그대로 둠
-    """
     out = []
     for m in materials:
         m2 = deepcopy(m)
@@ -293,7 +379,7 @@ def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir
             for f in files:
                 if hasattr(f, "getvalue"):  # UploadedFile
                     metas.append(upload_streamlit_file_to_github(f, files_dir, msg_prefix))
-                elif isinstance(f, dict) and "path" in f:  # 이미 메타데이터
+                elif isinstance(f, dict) and "path" in f:
                     metas.append(f)
             m2["files"] = metas
             m2["file"] = None
@@ -303,12 +389,11 @@ def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir
             if hasattr(f, "getvalue"):
                 m2["file"] = upload_streamlit_file_to_github(f, files_dir, msg_prefix)
             elif isinstance(f, dict) and "path" in f:
-                pass  # 그대로 유지
+                pass
             else:
                 m2["file"] = None
 
         else:
-            # 성경/설교전문 등
             if "files" in m2 and not isinstance(m2["files"], list):
                 m2["files"] = []
             if "file" in m2 and not isinstance(m2["file"], (dict, type(None))):
@@ -318,16 +403,10 @@ def materials_upload_and_detach_files(materials: List[Dict[str, Any]], files_dir
     return out
 
 # ---------------------------
-# build_docx (메타/로컬 모두 처리)
+# build_docx
 # ---------------------------
-def build_docx(
-    worship_date: date,
-    services: List[str],
-    materials: List[Dict[str, Any]],
-    user_name: str,
-    position: str,
-    role: str,
-) -> bytes:
+def build_docx(worship_date: date, services: List[str], materials: List[Dict[str, Any]],
+               user_name: str, position: str, role: str) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx가 설치되지 않았습니다. 'pip install python-docx' 실행 후 다시 시도해주세요.")
     doc = Document()
@@ -463,13 +542,7 @@ def gh_paths(user_name: str, worship_date: date, submission_id: str = None):
 # ① 날짜/예배 선택
 # ---------------------------
 st.markdown("<div class='section-title'>① 날짜/예배 선택</div>", unsafe_allow_html=True)
-
-worship_date = st.date_input(
-    "예배 날짜",
-    value=st.session_state.worship_date,
-    format="YYYY-MM-DD",
-    disabled=not can_edit
-)
+worship_date = st.date_input("예배 날짜", value=st.session_state.worship_date, format="YYYY-MM-DD", disabled=not can_edit)
 st.session_state.worship_date = worship_date
 
 c1, c2 = st.columns([2, 1])
@@ -495,7 +568,7 @@ services = st.session_state.services_selected
 st.divider()
 
 # ---------------------------
-# ② 자료 추가 (순서 조절 포함)
+# ② 자료 추가 (성경/이미지/기타/설교 전문)
 # ---------------------------
 st.markdown("<div class='section-title'>② 자료 추가 (성경/이미지/기타/설교 전문)</div>", unsafe_allow_html=True)
 st.caption("• 설명(스토리보드)에서 **굵게**, ==형광펜== 으로 강조하면 Word에 그대로 반영됩니다.")
@@ -530,17 +603,19 @@ for i, item in enumerate(st.session_state.materials):
                 to_remove.append(item["id"])
 
         if item["kind"] == "성경 구절":
+            # ⬇️ 성경(책/장/절) 선택 위젯
+            render_bible_picker(item, disabled=not can_edit)
+            # ⬇️ 최종 텍스트 편집
             item["verse_text"] = st.text_area(
-                "성경 구절 입력 (예: 요한복음 3:16)",
+                "최종 본문 (필요시 직접 수정 가능)",
                 value=item.get("verse_text", ""),
                 key=f"verse_{item['id']}",
-                height=120,
+                height=160,
                 disabled=not can_edit
             )
             item["files"], item["file"] = [], None
 
         elif item["kind"] == "이미지":
-            # 기존 이미지(메타/업로드) 보존 + 신규 추가 병합
             existing = item.get("files") or []
             if existing:
                 with st.expander("📷 기존 이미지 보기", expanded=False):
@@ -563,12 +638,10 @@ for i, item in enumerate(st.session_state.materials):
                 item["files"] = existing + new_uploads
             else:
                 item["files"] = existing
-
             item["verse_text"] = ""
             item["file"] = None
 
         elif item["kind"] == "기타 파일":
-            # 기존 첨부 유지 + 새로 업로드 시 교체
             existing = item.get("file")
             if existing:
                 if isinstance(existing, dict):
@@ -587,7 +660,6 @@ for i, item in enumerate(st.session_state.materials):
                 item["file"] = new_one
             else:
                 item["file"] = existing
-
             item["verse_text"] = ""
             item["files"] = []
 
@@ -648,7 +720,7 @@ if do_save and can_edit:
 st.divider()
 
 # ---------------------------
-# ④ 저장/불러오기/제출 (맨 하단)
+# ④ 저장/불러오기/제출 (GitHub)
 # ---------------------------
 st.markdown("#### 저장/제출")
 b1, b2, b3, _ = st.columns([1,1,1,3])
@@ -659,10 +731,20 @@ with b2:
 with b3:
     submit_now = st.button("✅ 제출", disabled=not can_edit)
 
+def serialize_submission():
+    return {
+        "worship_date": str(st.session_state.get("worship_date")),
+        "services": st.session_state.get("services_selected", []),
+        "materials": st.session_state.get("materials", []),
+        "user_name": st.session_state.get("user_name"),
+        "position": st.session_state.get("position"),
+        "role": st.session_state.get("role"),
+        "saved_at": datetime.now(timezone.utc).isoformat()
+    }
+
 if save_draft and can_edit:
     try:
         p = gh_paths(st.session_state.user_name, worship_date)  # draft
-        # 파일 업로드 + materials 메타 치환
         materials_detached = materials_upload_and_detach_files(
             st.session_state.materials, p["files_dir"], msg_prefix="[draft-files]"
         )
@@ -694,22 +776,19 @@ if submit_now and can_edit:
         st.session_state.submission_id = sub_id
         p = gh_paths(st.session_state.user_name, worship_date, submission_id=sub_id)
 
-        # 1) 파일 업로드 + materials 메타 치환
         materials_detached = materials_upload_and_detach_files(
             st.session_state.materials, p["files_dir"], msg_prefix="[submit-files]"
         )
 
-        # 2) DOCX 생성 (세션 데이터 기준)
         docx_bytes = build_docx(
             worship_date=worship_date,
             services=st.session_state.services_selected,
-            materials=st.session_state.materials,  # 에디터에 보이는 현재 상태
+            materials=st.session_state.materials,
             user_name=st.session_state.user_name,
             position=st.session_state.position,
             role=st.session_state.role
         )
 
-        # 3) JSON 업로드 (메타데이터 포함)
         data = serialize_submission()
         data["status"] = "submitted"
         data["submission_id"] = sub_id
@@ -819,8 +898,8 @@ st.markdown(
     <hr/>
     <div class='small-note'>
     ⚙️ 이미지 외의 기타 파일은 Word에 직접 삽입되지 않으며, 파일명과 설명이 기록됩니다.<br>
-    🖨️ 출력은 Word에서 페이지 여백/서식을 조정해 인쇄하면 보기 좋습니다.<br>
-    ✍️ 강조법: **굵게**, ==형광펜== (Word 변환 시 자동 적용)
+    ✍️ 강조법: **굵게**, ==형광펜== (Word 변환 시 자동 적용)<br>
+    🔗 성경 본문은 GitHub의 JSON(bsk_json)에서 로드됩니다.
     </div>
     """,
     unsafe_allow_html=True
