@@ -334,7 +334,11 @@ def render_bible_picker(item: Dict[str, Any], disabled: bool):
         new_block = preview.strip()
         if new_block:
             item["verse_text"] = (prev + ("\n" if prev else "") + new_block).strip()
+            # ★ 텍스트박스 state도 갱신 + 즉시 리렌더링
+            verse_key = f"verse_{item['id']}"
+            st.session_state[verse_key] = item["verse_text"]
             st.success("말씀을 본문 내용에 추가했습니다.")
+            st.rerun()
         else:
             st.warning("추가할 본문이 없습니다. 책/장/절을 확인해 주세요.")
 
@@ -603,14 +607,20 @@ for i, item in enumerate(st.session_state.materials):
         if item["kind"] == "성경 구절":
             # ⬇️ 성경(책/장/절) 선택 위젯
             render_bible_picker(item, disabled=not can_edit)
-            # ⬇️ 본문 내용(편집 가능)
-            item["verse_text"] = st.text_area(
-                "본문 내용",  # ← 라벨 변경
-                value=item.get("verse_text", ""),
-                key=f"verse_{item['id']}",
+
+            # ⬇️ 본문 내용(편집 가능) — value를 쓰지 않고 session_state로 제어
+            verse_key = f"verse_{item['id']}"
+            if verse_key not in st.session_state:
+                st.session_state[verse_key] = item.get("verse_text", "")
+            txt = st.text_area(
+                "본문 내용",
+                key=verse_key,
                 height=160,
                 disabled=not can_edit
             )
+            # 위젯 값 ↔ 데이터 동기화
+            item["verse_text"] = txt
+
             item["files"], item["file"] = [], None
 
         elif item["kind"] == "이미지":
@@ -725,7 +735,7 @@ b1, b2, b3, _ = st.columns([1,1,1,3])
 with b1:
     save_draft = st.button("💾 임시 저장", disabled=not can_edit)
 with b2:
-    load_draft = st.button("↩️ 불러오기", disabled=not can_edit)  # ← 텍스트 단순화
+    load_draft = st.button("↩️ 불러오기", disabled=not can_edit)  # 라벨 단순화
 with b3:
     submit_now = st.button("✅ 제출", disabled=not can_edit)
 
