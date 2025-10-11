@@ -328,17 +328,15 @@ def render_bible_picker(item: Dict[str, Any], disabled: bool):
 
     st.text_area("미리보기", value=preview, height=140, disabled=True)
 
-    c4, c5 = st.columns([1, 1])
-    with c4:
-        if st.button("본문 삽입 (뒤에 추가)", key=f"bible_insert_append_{item['id']}", disabled=disabled):
-            prev = item.get("verse_text", "") or ""
-            new_block = preview.strip()
-            item["verse_text"] = (prev + ("\n" if prev and new_block else "") + new_block).strip()
-            st.success("본문을 추가했습니다.")
-    with c5:
-        if st.button("본문 대체 (전체 교체)", key=f"bible_insert_replace_{item['id']}", disabled=disabled):
-            item["verse_text"] = preview.strip()
-            st.success("본문을 교체했습니다.")
+    # 🔁 버튼 하나만: 말씀 추가 → 본문 내용(verse_text)에 이어붙이기
+    if st.button("📥 말씀 추가", key=f"bible_insert_{item['id']}", disabled=disabled):
+        prev = item.get("verse_text", "") or ""
+        new_block = preview.strip()
+        if new_block:
+            item["verse_text"] = (prev + ("\n" if prev else "") + new_block).strip()
+            st.success("말씀을 본문 내용에 추가했습니다.")
+        else:
+            st.warning("추가할 본문이 없습니다. 책/장/절을 확인해 주세요.")
 
 # ---------------------------
 # 파일 업로드 보조(메타데이터화)
@@ -605,9 +603,9 @@ for i, item in enumerate(st.session_state.materials):
         if item["kind"] == "성경 구절":
             # ⬇️ 성경(책/장/절) 선택 위젯
             render_bible_picker(item, disabled=not can_edit)
-            # ⬇️ 최종 텍스트 편집
+            # ⬇️ 본문 내용(편집 가능)
             item["verse_text"] = st.text_area(
-                "최종 본문 (필요시 직접 수정 가능)",
+                "본문 내용",  # ← 라벨 변경
                 value=item.get("verse_text", ""),
                 key=f"verse_{item['id']}",
                 height=160,
@@ -727,20 +725,9 @@ b1, b2, b3, _ = st.columns([1,1,1,3])
 with b1:
     save_draft = st.button("💾 임시 저장", disabled=not can_edit)
 with b2:
-    load_draft = st.button("↩️ 불러오기(임시저장)", disabled=not can_edit)
+    load_draft = st.button("↩️ 불러오기", disabled=not can_edit)  # ← 텍스트 단순화
 with b3:
     submit_now = st.button("✅ 제출", disabled=not can_edit)
-
-def serialize_submission():
-    return {
-        "worship_date": str(st.session_state.get("worship_date")),
-        "services": st.session_state.get("services_selected", []),
-        "materials": st.session_state.get("materials", []),
-        "user_name": st.session_state.get("user_name"),
-        "position": st.session_state.get("position"),
-        "role": st.session_state.get("role"),
-        "saved_at": datetime.now(timezone.utc).isoformat()
-    }
 
 if save_draft and can_edit:
     try:
